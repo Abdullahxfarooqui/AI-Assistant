@@ -9,6 +9,9 @@ pandas>=2.0.0
 openpyxl>=3.1.0
 xlrd>=2.0.0
 
+# Visualizations
+plotly>=5.18.0
+
 # Vector database
 faiss-cpu>=1.7.4
 
