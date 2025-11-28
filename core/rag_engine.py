@@ -46,8 +46,14 @@ try:
 except ImportError:
     HAS_DATA_ENGINE = False
 
-# OpenRouter API configuration
-OPENROUTER_API_KEY = "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"
+# OpenRouter API configuration - Use environment variable or Streamlit secrets
+import os
+try:
+    import streamlit as st
+    OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", os.environ.get("OPENROUTER_API_KEY", ""))
+except:
+    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL = "openai/gpt-4o-mini"  # Fast model for quick responses
 
