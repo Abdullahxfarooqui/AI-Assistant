@@ -7,6 +7,7 @@ Handles large files (15-50MB+) with:
 - Trend and anomaly detection
 - Auto-generated charts and visualizations
 - Progress indicators for all operations
+- METRIC-FOCUSED: Only shows charts for the metric user asked about
 """
 import streamlit as st
 import sys
@@ -32,7 +33,11 @@ from core.rag_engine import (
     list_documents,
     get_document_info,
     compare_documents,
-    set_dataframe_cache
+    set_dataframe_cache,
+    get_target_columns,
+    detect_specific_metrics,
+    is_general_query,
+    METRIC_COLUMNS
 )
 
 # Global DataFrame cache for visualizations
@@ -974,6 +979,8 @@ def render_query():
         # Show intent
         intent = result.get("intent", "general")
         intent_info = {
+            "general_overview": ("📋", "Dataset Overview"),  # NO CHARTS for this
+            "metric_lookup": ("🔢", "Metric Lookup"),
             "explain": ("📖", "Explanation"),
             "summarize": ("📋", "Summary"),
             "calculate": ("🔢", "Calculation"),
@@ -991,8 +998,32 @@ def render_query():
         st.markdown("### 📝 Answer")
         st.markdown(result.get("answer", "No answer generated"))
         
-        # Show inline visualizations based on intent
-        if show_viz and selected_filename:
+        # ====================================================================
+        # STRICT VISUALIZATION LOGIC
+        # ====================================================================
+        # Check if visualizations should be shown
+        # ONLY show visualizations if:
+        # 1. User explicitly asked for charts AND
+        # 2. User asked about a SPECIFIC resource (oil, gas, water, etc.)
+        # 
+        # DO NOT show visualizations for:
+        # - General queries ("what's in this document?")
+        # - Overview requests ("summarize the dataset")
+        # - Any query without a specific metric mentioned
+        # ====================================================================
+        
+        show_visualizations = result.get("show_visualizations", False)
+        specific_metrics = result.get("specific_metrics", [])
+        
+        # Double-check: if intent is general_overview, NEVER show visualizations
+        if intent == "general_overview":
+            show_visualizations = False
+        
+        # Also check the query directly - if no specific resource mentioned, no charts
+        if is_general_query(user_query):
+            show_visualizations = False
+        
+        if show_viz and selected_filename and show_visualizations and specific_metrics:
             df = get_cached_dataframe(selected_filename)
             if df is None:
                 # Try loading from uploads directory
@@ -1025,13 +1056,44 @@ def render_query():
             
             if df is not None:
                 st.markdown("---")
-                st.markdown("### 📊 Relevant Visualizations")
+                st.markdown(f"### 📊 {', '.join(specific_metrics).upper()} Visualizations")
                 
-                # Get key columns
+                # Get key columns - FILTER by specific_metrics from query result
                 numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-                prod_cols = [c for c in numeric_cols if any(x in c.upper() for x in ['PROD', 'SALES', 'VOL', 'ENERGY'])][:6]
+                all_prod_cols = [c for c in numeric_cols if any(x in c.upper() for x in ['PROD', 'SALES', 'VOL', 'ENERGY', 'FUEL', 'FLARE', 'INJ'])]
                 
-                # Show quick stats metrics
+                # Use target_columns from result if available, otherwise filter by metric
+                target_cols = result.get('target_columns', [])
+                
+                if target_cols:
+                    # Use the pre-computed target columns
+                    prod_cols = [c for c in all_prod_cols if c in target_cols][:6]
+                else:
+                    # Fallback: filter by specific_metrics from result
+                    metric_filters = {
+                        'gas': ['GAS'],
+                        'oil': ['OIL'],
+                        'water': ['WAT', 'WATER'],
+                        'condensate': ['COND'],
+                        'lpg': ['LPG'],
+                        'ngl': ['NGL'],
+                        'heat': ['HEAT'],
+                        'energy': ['ENERGY', 'BTU']
+                    }
+                    
+                    filter_keywords = []
+                    for m in specific_metrics:
+                        filter_keywords.extend(metric_filters.get(m, []))
+                    
+                    prod_cols = [c for c in all_prod_cols 
+                                if any(kw in c.upper() for kw in filter_keywords)][:6]
+                
+                if prod_cols:
+                    st.info(f"📌 Showing charts for {', '.join(specific_metrics).upper()}: {', '.join(prod_cols)}")
+                else:
+                    st.warning("No matching columns found for the requested metric.")
+                
+                # Show quick stats metrics - ONLY for filtered columns
                 if prod_cols:
                     stat_cols = st.columns(min(len(prod_cols), 4))
                     for i, col in enumerate(prod_cols[:4]):
@@ -1100,19 +1162,37 @@ def render_query():
                         st.info("No categorical columns found.")
                 
                 with chart_tabs[2]:
-                    # Pie chart
+                    # Pie chart - only show for requested metrics
                     if len(prod_cols) >= 2:
                         totals = {col: df[col].sum() for col in prod_cols[:4]}
+                        specific_metrics = result.get('specific_metrics', [])
+                        title = f"{', '.join(specific_metrics).title()} Distribution" if specific_metrics else "Production Distribution"
                         fig = px.pie(
                             values=list(totals.values()),
                             names=list(totals.keys()),
-                            title="Production Distribution",
+                            title=title,
                             hole=0.4
                         )
                         fig.update_layout(height=350)
                         st.plotly_chart(fig, use_container_width=True)
+                    elif len(prod_cols) == 1:
+                        # Single metric - show breakdown by category if available
+                        cat_cols = [c for c in df.columns if df[c].dtype == 'object' and df[c].nunique() <= 20]
+                        if cat_cols:
+                            cat_col = cat_cols[0]
+                            agg_data = df.groupby(cat_col)[prod_cols[0]].sum().reset_index()
+                            agg_data = agg_data.nlargest(8, prod_cols[0])
+                            fig = px.pie(
+                                agg_data, values=prod_cols[0], names=cat_col,
+                                title=f"{prod_cols[0]} by {cat_col}",
+                                hole=0.4
+                            )
+                            fig.update_layout(height=350)
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info(f"Showing single metric: {prod_cols[0]} (Total: {df[prod_cols[0]].sum():,.0f})")
                     else:
-                        st.info("Need multiple numeric columns for distribution chart.")
+                        st.info("No production columns found for this metric.")
         
         # Show sources (collapsed)
         sources = result.get("sources", [])

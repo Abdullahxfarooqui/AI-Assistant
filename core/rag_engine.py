@@ -7,6 +7,7 @@ This engine:
 3. Preserves ALL data rows - no deduplication of valid data
 4. Handles large files (15-50MB+) efficiently
 5. Returns structured Markdown tables, not raw text
+6. INTENT-AWARE: Short answers for simple questions, detailed for complex
 
 Key Functions:
 - query(): Unified query with auto intent detection
@@ -18,7 +19,7 @@ Key Functions:
 - list_all_documents(): List all indexed documents
 """
 import requests
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple
 import re
 import json
 import pandas as pd
@@ -57,14 +58,48 @@ except:
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL = "openai/gpt-4o-mini"  # Fast model for quick responses
 
-# Performance settings
-MAX_CONTEXT_CHARS = 10000  # Increased for detailed analysis
-DEFAULT_MAX_TOKENS = 4000  # Increased for comprehensive responses
+# Performance settings - REDUCED for concise answers
+MAX_CONTEXT_CHARS = 6000  # Reduced - only include relevant context
+MAX_CONTEXT_CHARS_DETAILED = 12000  # For detailed mode
+DEFAULT_MAX_TOKENS = 2000  # Reduced default
+DEFAULT_MAX_TOKENS_DETAILED = 4000  # For detailed mode
 
 
 # ============================================================================
-# LLM SYSTEM PROMPTS - Focused on reasoning, NOT data extraction
+# LLM SYSTEM PROMPTS - FOCUSED & CONCISE
 # ============================================================================
+
+SYSTEM_PROMPT_CONCISE = """You are a precise RAG answering agent.
+
+CRITICAL RULES:
+1. Answer ONLY what the user asked - nothing more
+2. Keep answers SHORT (2-5 sentences for simple questions)
+3. If user asks about ONE metric, only answer about that metric
+4. DO NOT output full reports unless explicitly asked
+5. DO NOT dump entire dataset analysis
+6. If context is huge, extract ONLY the portion relevant to the question
+
+For metric questions (e.g., "What is oil production?"):
+- State the metric value with units
+- Give a 1-sentence explanation
+- That's it. No more.
+
+FORBIDDEN:
+- Full dataset summaries when not asked
+- All columns listing when not asked
+- Multi-section reports for simple questions
+- Statistics for unrelated metrics"""
+
+SYSTEM_PROMPT_DETAILED = """You are an expert data analyst providing comprehensive analysis.
+
+The user has requested DETAILED analysis. Provide:
+1. Complete overview of the requested topic
+2. All relevant statistics with proper formatting
+3. Trends and patterns
+4. Data quality notes
+5. Recommendations
+
+Use proper Markdown formatting with tables where appropriate."""
 
 SYSTEM_PROMPT_ANALYSIS = """You are an expert data analyst AI. Your role is to analyze STRUCTURED DATA and provide CLEAR, FORMATTED INSIGHTS.
 
@@ -80,19 +115,6 @@ DATA PRESENTATION GUIDELINES:
 - Always include units in parentheses: "PROD_OIL_VOL (bbl)" instead of separate UOM column
 - Round large numbers to 2 decimal places
 - Use comma separators for thousands
-
-RESPONSE STRUCTURE:
-## Overview
-(1-2 sentence summary)
-
-## Key Findings
-(Bullet points with specific values)
-
-## Data Preview
-(Clean table with 6-8 columns, max 10-15 rows)
-
-## Statistics Summary
-(Formatted statistics)
 
 YOU MUST NOT:
 - Dump raw data without formatting
@@ -130,6 +152,124 @@ Use specific values from both datasets in your comparison."""
 
 
 # ============================================================================
+# METRIC COLUMN MAPPING - STRICT FILTERING
+# ============================================================================
+
+# Define exact column mappings for each metric type
+METRIC_COLUMNS = {
+    "oil": ["PROD_OIL_VOL", "SALES_OIL_VOL", "INJ_OIL_VOL", "OIL_RATE", "OIL_DENSITY"],
+    "gas": ["PROD_GAS_VOL", "SALES_GAS_VOL", "FUEL_GAS_VOL", "INJ_GAS_VOL", "GAS_RATE", "GAS_DENSITY", "FLARE_GAS_VOL"],
+    "water": ["PROD_WAT_VOL", "SALES_WAT_VOL", "INJ_WAT_VOL", "WATER_RATE", "WATER_DENSITY"],
+    "condensate": ["PROD_COND_VOL", "SALES_COND_VOL", "COND_RATE", "COND_DENSITY"],
+    "lpg": ["PROD_LPG_VOL", "SALES_LPG_VOL", "LPG_RATE"],
+    "ngl": ["PROD_NGL_VOL", "SALES_NGL_VOL", "NGL_RATE"],
+    "heat": ["VOL_HEAT_SALES", "HEAT_RATE", "ENERGY_PROD", "ENERGY_SOLD"],
+    "energy": ["ENERGY_PROD", "ENERGY_SOLD", "ENERGY_RATE", "BTU"],
+    "injection": ["INJ_GAS_VOL", "INJ_WAT_VOL", "INJ_OIL_VOL", "INJ_RATE"],
+    "production": ["PROD_OIL_VOL", "PROD_GAS_VOL", "PROD_WAT_VOL", "PROD_COND_VOL", "PROD_LPG_VOL"],
+    "sales": ["SALES_OIL_VOL", "SALES_GAS_VOL", "SALES_WAT_VOL", "SALES_COND_VOL", "SALES_LPG_VOL"]
+}
+
+# Metric detection keywords
+METRIC_KEYWORDS = {
+    "oil": ["oil", "crude", "petroleum"],
+    "gas": ["gas", "natural gas", "mmcf", "mcf", "fuel gas", "flare"],
+    "water": ["water", "wat", "h2o", "brine", "produced water"],
+    "condensate": ["condensate", "cond"],
+    "lpg": ["lpg", "liquefied petroleum"],
+    "ngl": ["ngl", "natural gas liquid"],
+    "heat": ["heat", "thermal"],
+    "energy": ["energy", "btu", "mmbtu"],
+    "injection": ["injection", "inject", "injected"],
+    "production": ["production", "produced", "prod"],
+    "sales": ["sales", "sold", "sale"]
+}
+
+
+def get_target_columns(metrics: List[str], df_columns: List[str]) -> List[str]:
+    """
+    Get the EXACT columns to use based on detected metrics.
+    
+    STRICT FILTERING: Only returns columns that match the requested metric.
+    If user asks about gas, ONLY gas columns are returned - no oil, water, etc.
+    
+    Args:
+        metrics: List of detected metric types (e.g., ['gas'], ['oil', 'sales'])
+        df_columns: List of columns in the DataFrame
+        
+    Returns:
+        List of column names that match the requested metrics
+    """
+    if not metrics:
+        return []
+    
+    target_patterns = []
+    
+    # Collect all patterns for requested metrics
+    for metric in metrics:
+        if metric in METRIC_COLUMNS:
+            target_patterns.extend(METRIC_COLUMNS[metric])
+    
+    # If both production and a specific resource, filter to that resource's production
+    has_production = 'production' in metrics
+    has_sales = 'sales' in metrics
+    specific_resources = [m for m in metrics if m in ['oil', 'gas', 'water', 'condensate', 'lpg', 'ngl', 'heat', 'energy']]
+    
+    # Build final column list
+    matched_columns = []
+    
+    for col in df_columns:
+        col_upper = col.upper()
+        
+        # Skip UOM columns
+        if col_upper.endswith('_UOM'):
+            continue
+        
+        # Check if column matches any target pattern
+        for pattern in target_patterns:
+            if pattern in col_upper:
+                matched_columns.append(col)
+                break
+        else:
+            # Fallback: Check if column contains resource keyword
+            for resource in specific_resources:
+                resource_patterns = METRIC_COLUMNS.get(resource, [])
+                for pattern in resource_patterns:
+                    # Extract the core resource name (e.g., "OIL" from "PROD_OIL_VOL")
+                    if resource.upper() in col_upper:
+                        # Additional filter: if asking for production/sales, must have that prefix
+                        if has_production and 'PROD' not in col_upper:
+                            continue
+                        if has_sales and 'SALES' not in col_upper:
+                            continue
+                        # Must have VOL or RATE to be a metric column
+                        if 'VOL' in col_upper or 'RATE' in col_upper or 'ENERGY' in col_upper:
+                            if col not in matched_columns:
+                                matched_columns.append(col)
+                        break
+    
+    return matched_columns
+
+
+def filter_columns_for_metric(df_columns: List[str], query: str) -> Tuple[List[str], List[str]]:
+    """
+    Filter DataFrame columns to ONLY include columns relevant to the user's question.
+    
+    Returns:
+        Tuple of (target_columns, detected_metrics)
+    """
+    metrics = detect_specific_metrics(query)
+    
+    if not metrics:
+        # No specific metric detected - return empty (let handler decide)
+        return [], metrics
+    
+    target_columns = get_target_columns(metrics, df_columns)
+    
+    return target_columns, metrics
+
+
+# ============================================================================
 # LLM API CALL
 # ============================================================================
 
@@ -147,10 +287,13 @@ def call_llm(
         "X-Title": "RAG Engine"
     }
     
+    # Use appropriate token limit
+    token_limit = min(max_tokens, DEFAULT_MAX_TOKENS)
+    
     payload = {
         "model": LLM_MODEL,
         "messages": messages,
-        "max_tokens": min(max_tokens, DEFAULT_MAX_TOKENS),  # Cap tokens for speed
+        "max_tokens": token_limit,
         "temperature": temperature
     }
     
@@ -173,6 +316,507 @@ def call_llm(
 
 
 # ============================================================================
+# QUESTION COMPLEXITY & METRIC DETECTION
+# ============================================================================
+
+def is_general_query(query: str) -> bool:
+    """
+    STRICT CHECK: Is this a general/overview query with NO specific resource?
+    
+    General queries should NOT trigger any oil/gas/water visualizations.
+    They should only return dataset overview (rows, columns, date range).
+    
+    Returns:
+        True if general query (no specific metric), False if resource-specific
+    """
+    q = query.lower()
+    
+    # First check: Does the query mention ANY specific resource?
+    specific_resources = ['oil', 'gas', 'water', 'condensate', 'lpg', 'ngl', 
+                          'heat', 'energy', 'injection', 'fuel', 'flare']
+    
+    has_specific_resource = any(resource in q for resource in specific_resources)
+    
+    # If a specific resource is mentioned, NOT a general query
+    if has_specific_resource:
+        return False
+    
+    # General query patterns - these should NOT trigger visualizations
+    general_patterns = [
+        'what is in', 'what\'s in', 'whats in',
+        'tell me about', 'tell me what',
+        'summarize', 'summary', 'overview',
+        'describe', 'explain this', 'explain the',
+        'what does this', 'what is this',
+        'about this document', 'about this file', 'about the document',
+        'what are the columns', 'list columns', 'show columns',
+        'document info', 'file info', 'dataset info',
+        'what data', 'what information', 'what fields',
+        'give me a summary', 'provide summary', 'brief summary',
+        'high level', 'high-level', 'general overview'
+    ]
+    
+    if any(pattern in q for pattern in general_patterns):
+        return True
+    
+    # Very short queries without specific resources are likely general
+    words = q.split()
+    if len(words) <= 3 and not has_specific_resource:
+        return True
+    
+    return False
+
+
+def detect_detail_mode(query: str) -> str:
+    """
+    Detect the detail level requested by the user.
+    
+    Returns:
+        'detailed' - User wants full, comprehensive analysis (k=12-20)
+        'normal' - Standard medium-level response (k=6-10)
+        'brief' - Short, concise answer (k=3-5)
+    """
+    q = query.lower()
+    
+    # DETAILED mode triggers - user wants comprehensive analysis
+    detailed_triggers = [
+        'in detail', 'detailed', 'full', 'complete', 'comprehensive', 
+        'everything', 'all', 'entire', 'whole', 'in-depth', 'thorough', 
+        'elaborate', 'explain deeply', 'deep dive', 'full breakdown',
+        'full report', 'complete analysis', 'detailed analysis',
+        'give me everything', 'tell me everything', 'show me everything',
+        'all statistics', 'all metrics', 'full summary', 'complete summary',
+        'entire dataset', 'full dataset', 'deeply', 'extensively'
+    ]
+    
+    if any(trigger in q for trigger in detailed_triggers):
+        return 'detailed'
+    
+    # BRIEF mode triggers - user wants short answer
+    brief_triggers = [
+        'short', 'brief', 'quick', 'concise', 'simple', 
+        'just tell me', 'one line', 'summary only', 'tldr',
+        'in brief', 'briefly', 'quickly'
+    ]
+    
+    if any(trigger in q for trigger in brief_triggers):
+        return 'brief'
+    
+    # Default to normal mode
+    return 'normal'
+
+
+def get_retrieval_k(detail_mode: str, has_metrics: bool) -> int:
+    """
+    Get the number of chunks to retrieve based on detail mode.
+    
+    Args:
+        detail_mode: 'detailed', 'normal', or 'brief'
+        has_metrics: Whether specific metrics were detected
+    
+    Returns:
+        k value for retrieval
+    """
+    if detail_mode == 'detailed':
+        return 15  # 12-20 chunks for detailed analysis
+    elif detail_mode == 'brief':
+        return 4   # 3-5 chunks for brief answers
+    else:
+        return 8   # 6-10 chunks for normal queries
+
+
+def detect_specific_metrics(query: str) -> List[str]:
+    """
+    Detect which specific metrics the user is asking about.
+    Uses METRIC_KEYWORDS for comprehensive detection.
+    
+    IMPORTANT: When a specific resource (oil, gas, water) is detected,
+    we DON'T include generic 'production' or 'sales' since those would
+    add all resource types.
+    
+    Returns:
+        List of metric categories: ['oil'], ['gas'], ['water'], etc.
+        Empty list means no specific metric - could be general question
+    """
+    q = query.lower()
+    metrics = []
+    
+    # Specific resources take priority
+    specific_resources = ['oil', 'gas', 'water', 'condensate', 'lpg', 'ngl', 'heat', 'energy']
+    
+    # Check each metric type using METRIC_KEYWORDS
+    for metric_type, keywords in METRIC_KEYWORDS.items():
+        if any(keyword in q for keyword in keywords):
+            metrics.append(metric_type)
+    
+    # CRITICAL FIX: If we have specific resources, remove generic production/sales
+    # Because "gas production" should only show GAS, not all production
+    has_specific_resource = any(m in specific_resources for m in metrics)
+    
+    if has_specific_resource:
+        # Remove generic production/sales/injection since they would add other resources
+        metrics = [m for m in metrics if m in specific_resources]
+    
+    return metrics
+
+
+def is_simple_question(query: str) -> bool:
+    """
+    Determine if this is a simple, single-metric question.
+    
+    Simple questions:
+    - "What is oil production?"
+    - "Show me gas volume"
+    - "What is the total water?"
+    
+    Complex questions:
+    - "Give me complete analysis"
+    - "Summarize the entire dataset"
+    - "Compare all metrics"
+    """
+    q = query.lower()
+    
+    # If detailed mode is requested, not simple
+    if detect_detail_mode(query):
+        return False
+    
+    # Check for single metric questions
+    metrics = detect_specific_metrics(query)
+    if len(metrics) == 1 or len(metrics) == 2:  # e.g., "oil production" = 2 metrics
+        return True
+    
+    # Short questions are usually simple
+    word_count = len(q.split())
+    if word_count <= 8:
+        return True
+    
+    # Questions with "what is" about one thing
+    simple_patterns = [
+        r'^what is [\w\s]+\??$',
+        r'^show [\w\s]+$',
+        r'^tell me about [\w\s]+$',
+        r'^how much [\w\s]+\??$',
+        r'^what are the [\w\s]+\??$'
+    ]
+    
+    for pattern in simple_patterns:
+        if re.match(pattern, q):
+            return True
+    
+    return False
+
+
+def get_metric_specific_stats(df: pd.DataFrame, metrics: List[str]) -> str:
+    """
+    Get statistics ONLY for the requested metrics.
+    
+    Returns concise stats for just the asked metrics, not the whole dataset.
+    """
+    if df is None or df.empty:
+        return ""
+    
+    result_lines = []
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    
+    # Map metrics to column patterns
+    metric_patterns = {
+        'oil': ['OIL'],
+        'gas': ['GAS'],
+        'water': ['WAT', 'WATER'],
+        'condensate': ['COND'],
+        'energy': ['ENERGY', 'BTU'],
+        'injection': ['INJ'],
+        'sales': ['SALES'],
+        'production': ['PROD']
+    }
+    
+    # Find matching columns
+    matched_cols = []
+    for metric in metrics:
+        patterns = metric_patterns.get(metric, [metric.upper()])
+        for col in numeric_cols:
+            col_upper = col.upper()
+            if any(p in col_upper for p in patterns):
+                if 'VOL' in col_upper or 'VOLUME' in col_upper or col not in matched_cols:
+                    matched_cols.append(col)
+    
+    # Remove duplicates while preserving order
+    matched_cols = list(dict.fromkeys(matched_cols))
+    
+    # Limit to most relevant columns (volumes first)
+    volume_cols = [c for c in matched_cols if 'VOL' in c.upper()]
+    other_cols = [c for c in matched_cols if 'VOL' not in c.upper()]
+    matched_cols = (volume_cols + other_cols)[:5]  # Max 5 columns
+    
+    if not matched_cols:
+        return ""
+    
+    for col in matched_cols:
+        total = df[col].dropna().sum()
+        count = df[col].notna().sum()
+        avg = df[col].dropna().mean() if count > 0 else 0
+        
+        # Get unit
+        uom = ""
+        if col + "_UOM" in df.columns:
+            uom_vals = df[col + "_UOM"].dropna()
+            uom = f" {uom_vals.iloc[0]}" if len(uom_vals) > 0 else ""
+        
+        result_lines.append(f"**{col}**: Total = {total:,.2f}{uom}, Average = {avg:,.2f}{uom} ({count:,} records)")
+    
+    return "\n".join(result_lines)
+
+
+def compress_answer(answer: str, max_words: int = 150) -> str:
+    """
+    Compress a long answer to be more concise.
+    Used when detail_mode=False but LLM returned too much.
+    """
+    if not answer:
+        return answer
+    
+    words = answer.split()
+    if len(words) <= max_words:
+        return answer
+    
+    # Try to find a natural break point
+    sentences = re.split(r'(?<=[.!?])\s+', answer)
+    
+    compressed = []
+    word_count = 0
+    for sentence in sentences:
+        sentence_words = len(sentence.split())
+        if word_count + sentence_words > max_words:
+            break
+        compressed.append(sentence)
+        word_count += sentence_words
+    
+    if compressed:
+        return " ".join(compressed)
+    
+    # Fallback: just truncate
+    return " ".join(words[:max_words]) + "..."
+
+
+def generate_dynamic_summary(df: pd.DataFrame, detail_mode: str, chunks: List[Dict] = None) -> str:
+    """
+    Generate a DYNAMIC summary that adapts to the requested detail level.
+    Content is derived from actual data, not templates.
+    
+    Args:
+        df: The DataFrame to analyze
+        detail_mode: 'detailed', 'normal', or 'brief'
+        chunks: Optional retrieved chunks for additional context
+    
+    Returns:
+        Dynamic summary based on actual data content
+    """
+    if df is None or df.empty:
+        return "No data available to summarize."
+    
+    # Analyze the actual data
+    all_cols = df.columns.tolist()
+    all_cols_upper = [c.upper() for c in all_cols]
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    text_cols = df.select_dtypes(include=['object']).columns.tolist()
+    
+    # Detect timeframe
+    timeframe = ""
+    date_col = None
+    for col in df.columns:
+        if 'DATE' in col.upper() or 'TIME' in col.upper():
+            try:
+                dates = pd.to_datetime(df[col], errors='coerce').dropna()
+                if len(dates) > 0:
+                    date_col = col
+                    min_date = dates.min()
+                    max_date = dates.max()
+                    timeframe = f"{min_date.strftime('%B %Y')} to {max_date.strftime('%B %Y')}"
+                    break
+            except:
+                pass
+    
+    # Detect entities
+    entities = []
+    entity_counts = {}
+    for col in text_cols:
+        col_upper = col.upper()
+        if any(e in col_upper for e in ['WELL', 'FIELD', 'BATTERY', 'FACILITY', 'COMPLETION', 'ITEM']):
+            unique_count = df[col].nunique()
+            if unique_count > 0 and unique_count < 10000:
+                entity_name = col.replace('_', ' ').title()
+                entities.append(entity_name)
+                entity_counts[col] = unique_count
+    
+    # Categorize numeric columns
+    prod_cols = [c for c in numeric_cols if 'PROD' in c.upper() and 'VOL' in c.upper()]
+    sales_cols = [c for c in numeric_cols if 'SALES' in c.upper() and 'VOL' in c.upper()]
+    inj_cols = [c for c in numeric_cols if 'INJ' in c.upper() and 'VOL' in c.upper()]
+    energy_cols = [c for c in numeric_cols if any(x in c.upper() for x in ['ENERGY', 'BTU', 'HEAT'])]
+    
+    # ========================================================================
+    # BUILD SUMMARY BASED ON DETAIL LEVEL
+    # ========================================================================
+    
+    if detail_mode == 'brief':
+        # SHORT SUMMARY: 3-5 lines
+        lines = []
+        lines.append("This document contains oil and gas operational data.")
+        if timeframe:
+            lines.append(f"Time period: {timeframe}.")
+        metrics_found = []
+        if prod_cols: metrics_found.append("production")
+        if sales_cols: metrics_found.append("sales")
+        if inj_cols: metrics_found.append("injection")
+        if metrics_found:
+            lines.append(f"Includes {', '.join(metrics_found)} metrics.")
+        return " ".join(lines)
+    
+    elif detail_mode == 'detailed':
+        # DETAILED SUMMARY: 20-40 lines with full breakdown
+        sections = []
+        
+        # Overview
+        sections.append("**Document Overview**")
+        sections.append(f"This dataset contains comprehensive oil and gas operational records covering {timeframe if timeframe else 'multiple time periods'}.")
+        
+        # Production Metrics with actual values
+        if prod_cols:
+            sections.append("")
+            sections.append("**Production Metrics**")
+            for col in prod_cols[:6]:
+                data = df[col].dropna()
+                if len(data) > 0:
+                    total = data.sum()
+                    avg = data.mean()
+                    min_val = data.min()
+                    max_val = data.max()
+                    completeness = (len(data) / len(df)) * 100
+                    # Get UOM if available
+                    uom = ""
+                    if col + "_UOM" in df.columns:
+                        uom_vals = df[col + "_UOM"].dropna()
+                        uom = f" {uom_vals.iloc[0]}" if len(uom_vals) > 0 else ""
+                    sections.append(f"- **{col}**: Total={total:,.2f}{uom}, Avg={avg:,.2f}{uom}, Range=[{min_val:,.2f} - {max_val:,.2f}], Completeness={completeness:.1f}%")
+        
+        # Sales Metrics
+        if sales_cols:
+            sections.append("")
+            sections.append("**Sales Metrics**")
+            for col in sales_cols[:4]:
+                data = df[col].dropna()
+                if len(data) > 0:
+                    total = data.sum()
+                    avg = data.mean()
+                    completeness = (len(data) / len(df)) * 100
+                    uom = ""
+                    if col + "_UOM" in df.columns:
+                        uom_vals = df[col + "_UOM"].dropna()
+                        uom = f" {uom_vals.iloc[0]}" if len(uom_vals) > 0 else ""
+                    sections.append(f"- **{col}**: Total={total:,.2f}{uom}, Avg={avg:,.2f}{uom}, Completeness={completeness:.1f}%")
+        
+        # Injection Metrics
+        if inj_cols:
+            sections.append("")
+            sections.append("**Injection Metrics**")
+            for col in inj_cols[:3]:
+                data = df[col].dropna()
+                if len(data) > 0:
+                    total = data.sum()
+                    completeness = (len(data) / len(df)) * 100
+                    sections.append(f"- **{col}**: Total={total:,.2f}, Completeness={completeness:.1f}%")
+        
+        # Asset Information
+        if entity_counts:
+            sections.append("")
+            sections.append("**Asset Information**")
+            for col, count in list(entity_counts.items())[:5]:
+                sections.append(f"- {col}: {count} unique values")
+                # Show top values if reasonable
+                if count <= 10:
+                    top_vals = df[col].value_counts().head(5)
+                    top_str = ", ".join([f"{v}({c})" for v, c in top_vals.items()])
+                    sections.append(f"  Top entries: {top_str}")
+        
+        # Data Quality
+        sections.append("")
+        sections.append("**Data Quality Analysis**")
+        null_counts = df.isnull().sum()
+        high_null_cols = null_counts[null_counts > len(df) * 0.5].head(5)
+        if len(high_null_cols) > 0:
+            sections.append(f"- Columns with >50% missing data: {', '.join(high_null_cols.index.tolist())}")
+        else:
+            sections.append("- Data completeness is generally good across all columns.")
+        
+        # Time patterns if date exists
+        if date_col:
+            sections.append("")
+            sections.append("**Temporal Coverage**")
+            sections.append(f"- Date range: {timeframe}")
+            date_series = pd.to_datetime(df[date_col], errors='coerce').dropna()
+            if len(date_series) > 1:
+                date_diff = date_series.diff().dropna()
+                avg_interval = date_diff.mean()
+                sections.append(f"- Average data interval: {avg_interval.days} days")
+        
+        return "\n".join(sections)
+    
+    else:
+        # NORMAL SUMMARY: Medium detail (5-10 lines)
+        sections = []
+        
+        sections.append("**Document Summary**")
+        
+        # Domain description
+        opening = "This document contains daily operational data from the oil and gas sector"
+        if entities:
+            entity_str = ", ".join(entities[:3])
+            opening += f", tracking assets including {entity_str}"
+        opening += "."
+        sections.append(opening)
+        
+        if timeframe:
+            sections.append(f"The dataset covers the period from {timeframe}.")
+        
+        # Production summary
+        if prod_cols:
+            sections.append("")
+            sections.append("**Production Metrics**")
+            prod_types = []
+            if any('OIL' in c.upper() for c in prod_cols): prod_types.append("oil")
+            if any('GAS' in c.upper() for c in prod_cols): prod_types.append("gas")
+            if any('WAT' in c.upper() for c in prod_cols): prod_types.append("water")
+            if any('COND' in c.upper() for c in prod_cols): prod_types.append("condensate")
+            if prod_types:
+                prod_str = ", ".join(prod_types[:-1]) + f", and {prod_types[-1]}" if len(prod_types) > 1 else prod_types[0]
+                sections.append(f"Production volumes recorded for {prod_str}.")
+        
+        # Sales summary
+        if sales_cols:
+            sections.append("")
+            sections.append("**Sales Metrics**")
+            sections.append("Commercial sales volumes are tracked in this dataset.")
+        
+        # Other metrics
+        other = []
+        if inj_cols: other.append("injection volumes")
+        if energy_cols: other.append("energy measurements")
+        if other:
+            sections.append("")
+            sections.append(f"**Additional Metrics**: {', '.join(other)}.")
+        
+        sections.append("")
+        sections.append("This data provides a comprehensive view of field performance and operational activities.")
+        
+        return "\n".join(sections)
+
+
+def generate_dataset_overview(df: pd.DataFrame, filename: str = "") -> str:
+    """Wrapper for backward compatibility - generates normal-level summary."""
+    return generate_dynamic_summary(df, 'normal')
+
+
+# ============================================================================
 # INTENT DETECTION
 # ============================================================================
 
@@ -180,30 +824,49 @@ def detect_intent(query: str) -> str:
     """
     Detect query intent for optimized response strategy.
     
+    STRICT INTENT ROUTING:
+    - general_overview: NO visualizations, just dataset metadata
+    - resource_specific: Only show charts for the mentioned resource
+    
     Intents:
-    - calculate: Totals, sums, averages (PRIORITY - fast Python computation)
+    - general_overview: General queries with NO specific resource -> NO CHARTS
+    - summarize: Brief summary 
     - explain: What is this, describe, overview
-    - summarize: Brief summary
+    - calculate: Totals, sums, averages (fast Python computation)
     - show: Display data, tables
     - search: Find specific records
     - compare: Compare documents or values
     - trend: Trend analysis
     - anomaly: Outlier detection
-    - general: Default
+    - general: Default fallback
     """
     q = query.lower()
     
-    # PRIORITY: Check for calculations FIRST (these use fast Python, not LLM)
-    if any(w in q for w in ['total', 'sum', 'average', 'avg', 'count', 'how many', 'how much', 
-                             'calculate', 'mean', 'median', 'minimum', 'maximum', 'min', 'max',
-                             'production of', 'sales of', 'volume of']):
+    # FIRST: Check if this is a GENERAL query with no specific resource
+    # These should NEVER trigger oil/gas/water visualizations
+    if is_general_query(query):
+        return "general_overview"
+    
+    # SECOND: Check for explicit summary/explain requests
+    if any(w in q for w in ['summarize', 'summary', 'give me summary', 'document summary', 'brief overview', 'key points', 'main points']):
+        return "summarize"
+    
+    if any(w in q for w in ['what is this', 'what does this', 'describe this', 'explain this', 'overview of', 'what are the columns', 'about this document', 'about this file']):
+        return "explain"
+    
+    # Check for calculations - but only if it's a specific calculation question
+    calc_keywords = ['total', 'sum', 'average', 'avg', 'count', 'how many', 'how much', 
+                     'calculate', 'mean', 'median', 'minimum', 'maximum', 'min of', 'max of']
+    calc_patterns = ['what is the total', 'what is the sum', 'what is the average',
+                     'give me total', 'give me the total', 'show total', 'show the total',
+                     'calculate the', 'compute the', 'find the total', 'find the sum']
+    
+    if any(w in q for w in calc_keywords) or any(p in q for p in calc_patterns):
         return "calculate"
     
-    # Other intents (use LLM)
-    if any(w in q for w in ['what is', 'what does', 'tell me about', 'describe', 'explain', 'overview', 'what are the columns']):
+    # Resource-specific queries (oil, gas, water mentioned) -> these CAN have charts
+    if any(w in q for w in ['what is', 'what does', 'describe', 'explain', 'overview']):
         return "explain"
-    if any(w in q for w in ['summarize', 'summary', 'brief', 'quick overview', 'key points']):
-        return "summarize"
     if any(w in q for w in ['show', 'list', 'display', 'all data', 'all rows', 'table', 'full data']):
         return "show"
     if any(w in q for w in ['find', 'search', 'where', 'filter', 'which', 'records with', 'entries where']):
@@ -404,9 +1067,11 @@ def query(
     Main unified query function with intelligent intent detection.
     
     This function:
-    1. Detects query intent (explain, calculate, show, search, etc.)
-    2. For calculations with DataFrame: Uses Python directly (FAST, no LLM)
-    3. For other queries: Retrieves context and uses LLM
+    1. Detects query complexity (simple vs detailed)
+    2. Detects specific metrics being asked about
+    3. For calculations with DataFrame: Uses Python directly (FAST, no LLM)
+    4. For simple questions: Returns CONCISE answers
+    5. For detailed requests: Returns comprehensive analysis
     
     Args:
         user_query: User's natural language query
@@ -417,18 +1082,83 @@ def query(
     Returns:
         Dict with answer, sources, intent, and metadata
     """
-    # Detect intent FIRST
+    # Detect question complexity and specific metrics
+    detail_mode = detect_detail_mode(user_query)  # Returns "detailed", "normal", or "short"
+    specific_metrics = detect_specific_metrics(user_query)
+    simple_question = is_simple_question(user_query)
+    
+    # Detect intent
     intent = detect_intent(user_query)
+    
+    # ========================================================================
+    # DYNAMIC K-VALUE ADJUSTMENT BASED ON DETAIL MODE
+    # ========================================================================
+    if detail_mode == "detailed":
+        k = max(k, 15)  # More chunks for detailed answers
+    elif detail_mode == "short":
+        k = min(k, 3)   # Fewer chunks for short/brief answers
+    elif simple_question:
+        k = min(k, 5)   # Limited chunks for simple questions
+    # else: use default k for normal mode
+    
+    # ========================================================================
+    # GENERAL OVERVIEW: No specific resource mentioned -> NO VISUALIZATIONS
+    # ========================================================================
+    if intent == "general_overview" and dataframe is not None and not dataframe.empty:
+        # Get vector chunks for dynamic summary generation
+        store = get_vector_store()
+        query_embedding = embed_query(user_query)
+        chunks = store.search_with_context(query_embedding, k=k, context_window=1, doc_hash=doc_hash)
+        
+        # Generate dynamic summary based on detail mode and chunks
+        answer = generate_dynamic_summary(dataframe, detail_mode, chunks)
+        return {
+            "answer": answer,
+            "sources": [],
+            "intent": "general_overview",  # This tells app.py to NOT show charts
+            "detail_mode": detail_mode,
+            "specific_metrics": [],  # Empty = no specific metrics
+            "target_columns": [],    # Empty = no charts
+            "show_visualizations": False,  # Explicit flag
+            "num_chunks": len(chunks) if chunks else 0
+        }
+    
+    # Additional adjustment for simple metric questions
+    if simple_question and detail_mode == "normal":
+        k = min(k, 3)  # Only 3 chunks for simple questions
     
     # FAST PATH: If calculate intent and we have DataFrame, skip vector search entirely
     if intent == "calculate" and dataframe is not None and not dataframe.empty:
-        answer = _handle_calculate_intent(user_query, "", doc_hash, dataframe)
+        # Get target columns for this metric
+        target_columns = get_target_columns(specific_metrics, dataframe.columns.tolist())
+        answer = _handle_calculate_intent(user_query, "", doc_hash, dataframe, detail_mode, specific_metrics)
         return {
             "answer": answer,
             "sources": [],
             "intent": intent,
+            "detail_mode": detail_mode,
+            "specific_metrics": specific_metrics,
+            "target_columns": target_columns,
+            "show_visualizations": len(specific_metrics) > 0,  # Only if specific metric asked
             "num_chunks": 0
         }
+    
+    # SIMPLE METRIC QUESTION: Direct Python answer, no LLM needed
+    if simple_question and specific_metrics and dataframe is not None and not dataframe.empty:
+        # Get target columns for this metric
+        target_columns = get_target_columns(specific_metrics, dataframe.columns.tolist())
+        answer = _handle_simple_metric_question(user_query, dataframe, specific_metrics)
+        if answer:  # If we got a good answer
+            return {
+                "answer": answer,
+                "sources": [],
+                "intent": "metric_lookup",
+                "detail_mode": False,
+                "specific_metrics": specific_metrics,
+                "target_columns": target_columns,
+                "show_visualizations": True,  # Specific metric = show charts
+                "num_chunks": 0
+            }
     
     # NORMAL PATH: Vector search for other intents
     store = get_vector_store()
@@ -471,27 +1201,31 @@ def query(
             "intent": "no_data"
         }
     
-    # Detect intent
-    intent = detect_intent(user_query)
+    # Build context - adjust size based on detail mode
+    is_detailed = (detail_mode == "detailed")
+    max_context = MAX_CONTEXT_CHARS_DETAILED if is_detailed else MAX_CONTEXT_CHARS
+    context = build_structured_context(results, doc_hash, max_chars=max_context)
     
-    # Build context with pre-computed stats
-    context = build_structured_context(results, doc_hash)
-    
-    # Add pre-computed statistics from Python (not LLM)
-    if df is not None:
+    # For simple questions with specific metrics, use focused stats only
+    if simple_question and specific_metrics and df is not None:
+        focused_stats = get_metric_specific_stats(df, specific_metrics)
+        if focused_stats:
+            context = focused_stats + "\n\n" + context[:2000]  # Limited context
+    elif df is not None:
         stats = compute_stats_for_query(df, user_query)
         if stats:
-            context = stats + "\n\n---\n\n" + context[:MAX_CONTEXT_CHARS - len(stats) - 100]
+            context = stats + "\n\n---\n\n" + context[:max_context - len(stats) - 100]
     
     # Handle different intents with appropriate strategies
+    # Pass detail_mode and specific_metrics to handlers
     if intent == "show":
-        answer = _handle_show_intent(user_query, context, doc_hash)
+        answer = _handle_show_intent(user_query, context, doc_hash, detail_mode)
     elif intent == "calculate":
-        answer = _handle_calculate_intent(user_query, context, doc_hash, df)
+        answer = _handle_calculate_intent(user_query, context, doc_hash, df, detail_mode, specific_metrics)
     elif intent == "explain":
-        answer = _handle_explain_intent(user_query, context, df)
+        answer = _handle_explain_intent(user_query, context, df, detail_mode, specific_metrics)
     elif intent == "summarize":
-        answer = _handle_summarize_intent(user_query, context)
+        answer = _handle_summarize_intent(user_query, context, df, detail_mode)
     elif intent == "search":
         answer = _handle_search_intent(user_query, context)
     elif intent == "trend":
@@ -499,7 +1233,14 @@ def query(
     elif intent == "anomaly":
         answer = _handle_anomaly_intent(user_query, context, doc_hash)
     else:
-        answer = _handle_general_intent(user_query, context)
+        answer = _handle_general_intent(user_query, context, detail_mode, specific_metrics)
+    
+    # POST-PROCESSING: Compress answer if too long for simple/short questions
+    if detail_mode == "short" or (detail_mode == "normal" and simple_question):
+        word_count = len(answer.split())
+        max_words = 80 if detail_mode == "short" else 150
+        if word_count > max_words:
+            answer = compress_answer(answer, max_words=max_words)
     
     # Format sources for return
     sources = []
@@ -512,26 +1253,119 @@ def query(
             "type": r.get("type", "text")
         })
     
+    # Get target columns for visualization filtering
+    target_columns = []
+    if specific_metrics and df is not None:
+        target_columns = get_target_columns(specific_metrics, df.columns.tolist())
+    
+    # Determine if visualizations should be shown
+    # ONLY show visualizations if user asked about a SPECIFIC resource
+    show_visualizations = len(specific_metrics) > 0 and len(target_columns) > 0
+    
     return {
         "answer": answer,
         "sources": sources,
         "intent": intent,
+        "detail_mode": detail_mode,
+        "specific_metrics": specific_metrics,
+        "target_columns": target_columns,
+        "show_visualizations": show_visualizations,
         "num_chunks": len(results)
     }
 
 
 # ============================================================================
-# INTENT HANDLERS
+# INTENT HANDLERS - REFACTORED FOR CONCISE ANSWERS
 # ============================================================================
 
-def _handle_show_intent(query: str, context: str, doc_hash: Optional[str]) -> str:
-    """Handle 'show data' type queries - return formatted data summary."""
-    # Truncate context for speed
-    context = context[:MAX_CONTEXT_CHARS]
+def _handle_simple_metric_question(query: str, df: pd.DataFrame, metrics: List[str]) -> Optional[str]:
+    """
+    Handle simple metric questions with direct Python computation.
+    Returns a SHORT, FOCUSED answer about just the asked metric.
     
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_ANALYSIS},
-        {"role": "user", "content": f"""Show data overview.
+    Example: "What is oil production?" -> Returns only oil production stats
+    """
+    if df is None or df.empty or not metrics:
+        return None
+    
+    result_lines = []
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    
+    # Map metrics to column patterns
+    metric_patterns = {
+        'oil': ['OIL'],
+        'gas': ['GAS'],
+        'water': ['WAT', 'WATER'],
+        'condensate': ['COND'],
+        'energy': ['ENERGY', 'BTU'],
+        'injection': ['INJ'],
+        'sales': ['SALES'],
+        'production': ['PROD']
+    }
+    
+    # Find matching columns - prioritize volume columns
+    matched_cols = []
+    for metric in metrics:
+        patterns = metric_patterns.get(metric, [metric.upper()])
+        for col in numeric_cols:
+            col_upper = col.upper()
+            # Prioritize volume columns
+            if any(p in col_upper for p in patterns) and 'VOL' in col_upper:
+                if col not in matched_cols:
+                    matched_cols.append(col)
+    
+    # If no volume columns, try any matching columns
+    if not matched_cols:
+        for metric in metrics:
+            patterns = metric_patterns.get(metric, [metric.upper()])
+            for col in numeric_cols:
+                col_upper = col.upper()
+                if any(p in col_upper for p in patterns):
+                    if col not in matched_cols and len(matched_cols) < 3:
+                        matched_cols.append(col)
+    
+    if not matched_cols:
+        return None
+    
+    # Build concise answer
+    metric_name = metrics[0].title() if metrics else "Data"
+    result_lines.append(f"## {metric_name} Summary\n")
+    
+    for col in matched_cols[:3]:  # Max 3 columns
+        total = df[col].dropna().sum()
+        count = df[col].notna().sum()
+        avg = df[col].dropna().mean() if count > 0 else 0
+        
+        # Get unit
+        uom = ""
+        if col + "_UOM" in df.columns:
+            uom_vals = df[col + "_UOM"].dropna()
+            uom = f" {uom_vals.iloc[0]}" if len(uom_vals) > 0 else ""
+        
+        result_lines.append(f"**{col}**:")
+        result_lines.append(f"- Total: {total:,.2f}{uom}")
+        result_lines.append(f"- Daily Average: {avg:,.2f}{uom}")
+        result_lines.append(f"- Records: {count:,}\n")
+    
+    # Add brief explanation
+    if 'oil' in metrics:
+        result_lines.append("*Oil production represents crude oil extracted from wells, measured in barrels (bbl).*")
+    elif 'gas' in metrics:
+        result_lines.append("*Gas production represents natural gas volume, typically measured in MMcf (million cubic feet).*")
+    elif 'water' in metrics:
+        result_lines.append("*Water production represents produced water from wells, measured in barrels (bbl).*")
+    
+    return "\n".join(result_lines)
+
+
+def _handle_show_intent(query: str, context: str, doc_hash: Optional[str], detail_mode: str = "normal") -> str:
+    """Handle 'show data' type queries - return formatted data summary."""
+    is_detailed = (detail_mode == "detailed")
+    max_tokens = 2500 if is_detailed else 1000
+    context = context[:MAX_CONTEXT_CHARS_DETAILED if is_detailed else MAX_CONTEXT_CHARS]
+    
+    if is_detailed:
+        prompt = f"""Show comprehensive data overview.
 
 QUERY: {query}
 
@@ -539,20 +1373,50 @@ DATA:
 {context}
 
 Provide:
-1. Brief overview (2 sentences)
-2. Sample table (5-6 key columns, 8 rows max)
-3. Key stats (totals, averages)"""}
+1. Full overview
+2. Sample table (key columns, up to 15 rows)
+3. Complete statistics
+4. Data quality notes"""
+    else:
+        prompt = f"""Show data briefly.
+
+QUERY: {query}
+
+DATA:
+{context}
+
+Provide ONLY:
+1. 2-sentence overview
+2. Small sample table (5 columns, 5 rows max)
+Keep it short."""
+    
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_ANALYSIS if is_detailed else SYSTEM_PROMPT_CONCISE},
+        {"role": "user", "content": prompt}
     ]
     
-    return call_llm(messages, max_tokens=2000)
+    return call_llm(messages, max_tokens=max_tokens)
 
 
-def _handle_calculate_intent(query: str, context: str, doc_hash: Optional[str], df: Optional[pd.DataFrame] = None) -> str:
+def _handle_calculate_intent(
+    query: str, 
+    context: str, 
+    doc_hash: Optional[str], 
+    df: Optional[pd.DataFrame] = None,
+    detail_mode: str = "normal",
+    specific_metrics: List[str] = None
+) -> str:
     """Handle calculation queries - Python computes, LLM explains."""
     
     # If we have the DataFrame, compute the answer directly with Python
     if df is not None and not df.empty:
-        result_lines = ["## Calculation Results (computed by Python):\n"]
+        # Initialize result lines based on detail mode
+        is_detailed = (detail_mode == "detailed")
+        if is_detailed:
+            result_lines = ["## Calculation Results (Detailed Analysis)\n"]
+        else:
+            result_lines = ["## Results\n"]
+        
         q_lower = query.lower()
         
         # Convert object columns that might be numeric strings
@@ -566,61 +1430,69 @@ def _handle_calculate_intent(query: str, context: str, doc_hash: Optional[str], 
         # Get numeric columns
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
         
-        # Smart column matching - prioritize specific matches
-        requested_cols = []
-        
-        # Check for specific resource mentions
-        wants_oil = 'oil' in q_lower
-        wants_gas = 'gas' in q_lower
-        wants_water = 'water' in q_lower or 'wat' in q_lower
-        wants_sales = 'sales' in q_lower or 'sold' in q_lower
-        wants_production = 'production' in q_lower or 'produced' in q_lower or 'prod' in q_lower
-        
-        for col in numeric_cols:
-            col_upper = col.upper()
+        # Use specific_metrics if provided, otherwise detect from query
+        if specific_metrics:
+            requested_cols = []
+            metric_patterns = {
+                'oil': ['OIL'],
+                'gas': ['GAS'],
+                'water': ['WAT', 'WATER'],
+                'condensate': ['COND'],
+                'energy': ['ENERGY', 'BTU'],
+                'injection': ['INJ'],
+                'sales': ['SALES'],
+                'production': ['PROD']
+            }
+            for metric in specific_metrics:
+                patterns = metric_patterns.get(metric, [metric.upper()])
+                for col in numeric_cols:
+                    col_upper = col.upper()
+                    if any(p in col_upper for p in patterns) and 'VOL' in col_upper:
+                        if col not in requested_cols:
+                            requested_cols.append(col)
+        else:
+            # Smart column matching - prioritize specific matches
+            requested_cols = []
             
-            # Skip rate/density columns unless specifically asked
-            if any(x in col_upper for x in ['RATE', 'DENSITY', 'DEC_', 'INV', '_R_MIN']) and 'rate' not in q_lower:
-                continue
+            # Check for specific resource mentions
+            wants_oil = 'oil' in q_lower
+            wants_gas = 'gas' in q_lower
+            wants_water = 'water' in q_lower or 'wat' in q_lower
+            wants_sales = 'sales' in q_lower or 'sold' in q_lower
+            wants_production = 'production' in q_lower or 'produced' in q_lower or 'prod' in q_lower
             
-            # Match based on query specifics
-            if wants_oil and wants_sales and 'SALES' in col_upper and 'OIL' in col_upper:
-                requested_cols.append(col)
-            elif wants_oil and wants_production and 'PROD' in col_upper and 'OIL' in col_upper and 'VOL' in col_upper:
-                requested_cols.append(col)
-            elif wants_oil and 'OIL' in col_upper and 'VOL' in col_upper and not wants_sales:
-                # Default oil query = production volume
-                if 'PROD' in col_upper:
-                    requested_cols.append(col)
-            elif wants_gas and 'GAS' in col_upper and 'VOL' in col_upper:
-                if wants_sales and 'SALES' in col_upper:
-                    requested_cols.append(col)
-                elif 'PROD' in col_upper:
-                    requested_cols.append(col)
-            elif wants_water and ('WAT' in col_upper or 'WATER' in col_upper) and 'VOL' in col_upper:
-                requested_cols.append(col)
-        
-        # If no specific match, try broader matching
-        if not requested_cols:
             for col in numeric_cols:
                 col_upper = col.upper()
-                # Skip non-volume columns
-                if any(x in col_upper for x in ['RATE', 'DENSITY', 'DEC_', 'INV', '_R_MIN']):
+                
+                # Skip rate/density columns unless specifically asked
+                if any(x in col_upper for x in ['RATE', 'DENSITY', 'DEC_', 'INV', '_R_MIN']) and 'rate' not in q_lower:
                     continue
-                if wants_oil and 'OIL' in col_upper:
+                
+                # Match based on query specifics
+                if wants_oil and wants_sales and 'SALES' in col_upper and 'OIL' in col_upper:
                     requested_cols.append(col)
-                elif wants_gas and 'GAS' in col_upper:
+                elif wants_oil and wants_production and 'PROD' in col_upper and 'OIL' in col_upper and 'VOL' in col_upper:
                     requested_cols.append(col)
-                elif wants_water and 'WAT' in col_upper:
+                elif wants_oil and 'OIL' in col_upper and 'VOL' in col_upper and not wants_sales:
+                    if 'PROD' in col_upper:
+                        requested_cols.append(col)
+                elif wants_gas and 'GAS' in col_upper and 'VOL' in col_upper:
+                    if wants_sales and 'SALES' in col_upper:
+                        requested_cols.append(col)
+                    elif 'PROD' in col_upper:
+                        requested_cols.append(col)
+                elif wants_water and ('WAT' in col_upper or 'WATER' in col_upper) and 'VOL' in col_upper:
                     requested_cols.append(col)
+            
+            # If no specific match, use main production volumes
+            if not requested_cols:
+                main_cols = ['PROD_OIL_VOL', 'PROD_GAS_VOL', 'PROD_WAT_VOL', 'SALES_OIL_VOL', 'SALES_GAS_VOL']
+                requested_cols = [c for c in main_cols if c in numeric_cols]
         
-        # Still nothing? Use main production volumes
-        if not requested_cols:
-            main_cols = ['PROD_OIL_VOL', 'PROD_GAS_VOL', 'PROD_WAT_VOL', 'SALES_OIL_VOL', 'SALES_GAS_VOL']
-            requested_cols = [c for c in main_cols if c in numeric_cols]
-        
-        # Remove duplicates
+        # Remove duplicates and limit based on detail_mode
         requested_cols = list(dict.fromkeys(requested_cols))
+        max_cols = 8 if detail_mode else 3
+        requested_cols = requested_cols[:max_cols]
         
         # Compute totals
         if any(w in q_lower for w in ['total', 'sum', 'all', 'production', 'how much']):
@@ -706,10 +1578,25 @@ IMPORTANT: Use the exact values from PRE-COMPUTED STATISTICS above. Do not estim
     return call_llm(messages, max_tokens=1500)
 
 
-def _handle_explain_intent(query: str, context: str, df: Optional[pd.DataFrame] = None) -> str:
+def _handle_explain_intent(
+    query: str, 
+    context: str, 
+    df: Optional[pd.DataFrame] = None,
+    detail_mode: str = "normal",
+    specific_metrics: List[str] = None
+) -> str:
     """Handle 'explain/describe' queries - explain what the data contains."""
     
-    # Build comprehensive stats from DataFrame
+    # For simple questions about specific metrics, give SHORT answers
+    is_detailed = (detail_mode == "detailed")
+    if not is_detailed and specific_metrics and len(specific_metrics) <= 2:
+        if df is not None and not df.empty:
+            # Use the simple metric handler
+            simple_answer = _handle_simple_metric_question(query, df, specific_metrics)
+            if simple_answer:
+                return simple_answer
+    
+    # For detailed mode or complex questions, build comprehensive stats
     stats_for_prompt = ""
     if df is not None and not df.empty:
         stats_lines = []
@@ -879,21 +1766,109 @@ Create a thorough professional report using ALL the statistics above. Be specifi
     return call_llm(messages, max_tokens=4000)
 
 
-def _handle_summarize_intent(query: str, context: str) -> str:
-    """Handle summarization queries - concise overview with key stats."""
-    context = context[:MAX_CONTEXT_CHARS]
+def _handle_summarize_intent(
+    query: str, 
+    context: str, 
+    df: Optional[pd.DataFrame] = None,
+    detail_mode: str = "detailed"  # Summarize defaults to detailed
+) -> str:
+    """Handle summarization queries - comprehensive document summary."""
+    
+    # Build stats from DataFrame for better summary
+    is_detailed = (detail_mode == "detailed")
+    stats_section = ""
+    if df is not None and not df.empty:
+        stats_lines = []
+        stats_lines.append(f"📊 **Dataset Overview**: {len(df):,} records, {len(df.columns)} columns")
+        
+        # Get date range if available
+        date_cols = [c for c in df.columns if 'DATE' in c.upper() or 'TIME' in c.upper()]
+        for col in date_cols[:1]:  # Just first date column
+            try:
+                dates = pd.to_datetime(df[col], errors='coerce').dropna()
+                if len(dates) > 0:
+                    stats_lines.append(f"📅 **Date Range**: {dates.min().strftime('%Y-%m-%d')} to {dates.max().strftime('%Y-%m-%d')}")
+                    break
+            except:
+                pass
+        
+        # Key metrics - limit based on detail mode
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        prod_cols = [c for c in numeric_cols if 'PROD' in c.upper() and 'VOL' in c.upper()]
+        sales_cols = [c for c in numeric_cols if 'SALES' in c.upper() and 'VOL' in c.upper()]
+        
+        max_metrics = 6 if detail_mode else 3
+        if prod_cols or sales_cols:
+            stats_lines.append("\n**Key Metrics:**")
+            for col in (prod_cols + sales_cols)[:max_metrics]:
+                total = df[col].dropna().sum()
+                count = df[col].notna().sum()
+                null_count = df[col].isna().sum()
+                if count > 0:
+                    uom = ""
+                    if col + "_UOM" in df.columns:
+                        uom_vals = df[col + "_UOM"].dropna()
+                        uom = f" {uom_vals.iloc[0]}" if len(uom_vals) > 0 else ""
+                    stats_lines.append(f"  - {col}: Total {total:,.2f}{uom} (data in {count:,} records, {null_count:,} empty)")
+        
+        # Categories - only in detail mode
+        is_detailed = (detail_mode == "detailed")
+        if is_detailed:
+            cat_cols = ['ITEM_TYPE', 'FIELD_NAME', 'ITEM_NAME', 'SOURCE']
+            for col in cat_cols:
+                if col in df.columns:
+                    unique_vals = df[col].dropna().unique()
+                    if len(unique_vals) <= 5:
+                        stats_lines.append(f"  - {col}: {', '.join(str(v) for v in unique_vals[:5])}")
+                    else:
+                        stats_lines.append(f"  - {col}: {len(unique_vals)} unique values")
+        
+        stats_section = "\n".join(stats_lines)
+    
+    max_context = MAX_CONTEXT_CHARS_DETAILED if is_detailed else MAX_CONTEXT_CHARS
+    context = context[:max_context]
+    max_tokens = 2500 if is_detailed else 1000
+    
+    if is_detailed:
+        system_prompt = """You are a document analyst. Provide a comprehensive summary of the document/dataset.
+
+Structure your response as:
+## 📋 Document Summary
+Brief overview of what this document contains.
+
+## 📊 Key Statistics
+Important numbers and metrics from the data.
+
+## 🔍 Key Findings
+3-5 important observations about the data.
+
+## 📝 Notes
+Any missing data, anomalies, or important context."""
+    else:
+        system_prompt = """You are a document analyst. Provide a BRIEF summary.
+
+Keep it SHORT:
+- 2-3 sentence overview
+- 3-4 key metrics
+- 2-3 key findings
+No lengthy sections."""
     
     messages = [
-        {"role": "system", "content": "Summarize data concisely."},
-        {"role": "user", "content": f"""Summarize: {query}
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"""Summarize this document/dataset.
 
-DATA:
+USER REQUEST: {query}
+
+PRE-COMPUTED STATISTICS:
+{stats_section}
+
+DATA CONTEXT:
 {context}
 
-Provide: Overview, Key stats, 3 key findings."""}
+{"Provide a comprehensive summary." if detail_mode else "Keep it brief - max 150 words."}"""}
     ]
     
-    return call_llm(messages, max_tokens=1500)
+    return call_llm(messages, max_tokens=max_tokens)
 
 
 def _handle_search_intent(query: str, context: str) -> str:
@@ -947,21 +1922,56 @@ List unusual values with explanations."""}
     return call_llm(messages, max_tokens=1500)
 
 
-def _handle_general_intent(query: str, context: str) -> str:
-    """Handle general queries with flexible response."""
-    context = context[:MAX_CONTEXT_CHARS]
+def _handle_general_intent(
+    query: str, 
+    context: str,
+    detail_mode: str = "normal",
+    specific_metrics: List[str] = None
+) -> str:
+    """Handle general queries with flexible response - CONCISE by default."""
     
-    messages = [
-        {"role": "system", "content": "Answer data questions concisely with specific values."},
-        {"role": "user", "content": f"""Question: {query}
+    # Use smaller context for simple questions
+    is_detailed = (detail_mode == "detailed")
+    max_context = MAX_CONTEXT_CHARS_DETAILED if is_detailed else 3000
+    context = context[:max_context]
+    
+    if is_detailed:
+        system_prompt = SYSTEM_PROMPT_DETAILED
+        user_prompt = f"""Provide a detailed answer to this question.
+
+Question: {query}
 
 DATA:
 {context}
 
-Answer directly with relevant data."""}
+Give a comprehensive response with all relevant details."""
+        max_tokens = 2500
+    else:
+        system_prompt = SYSTEM_PROMPT_CONCISE
+        # For simple questions, be very direct
+        if specific_metrics:
+            metric_hint = f"Focus ONLY on: {', '.join(specific_metrics)}"
+        else:
+            metric_hint = "Answer briefly and directly"
+        
+        user_prompt = f"""Answer this question BRIEFLY (2-4 sentences max).
+
+Question: {query}
+
+{metric_hint}
+
+DATA:
+{context}
+
+Give a SHORT, DIRECT answer. Do NOT provide full dataset analysis."""
+        max_tokens = 500
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
     ]
     
-    return call_llm(messages, max_tokens=1500)
+    return call_llm(messages, max_tokens=max_tokens)
 
 
 # ============================================================================
