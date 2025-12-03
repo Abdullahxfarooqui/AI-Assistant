@@ -1,22 +1,18 @@
 """
 Production RAG Engine with Python-Based Data Analysis.
 
-This engine:
-1. Uses Python/Pandas for ALL table extraction and statistics (not LLM)
-2. LLM is ONLY for reasoning, insights, interpretations, comparisons, and trends
-3. Preserves ALL data rows - no deduplication of valid data
-4. Handles large files (15-50MB+) efficiently
-5. Returns structured Markdown tables, not raw text
-6. INTENT-AWARE: Short answers for simple questions, detailed for complex
+4-MODE INTELLIGENT ROUTING:
+1. DATA_QUERY → query_data() + generate_visuals() → Charts + Stats + Answer
+2. DOCUMENT_OVERVIEW → dataset_overview() → Full breakdown
+3. FREEFORM_QUERY → conversational_response() → Refuse (only data questions)
+4. SYSTEM_TASK → system_instruction() → Guidance message
 
-Key Functions:
-- query(): Unified query with auto intent detection
-- analyze_query(): Analyze specific queries with context
-- answer_question(): Answer questions about data
-- summarize_document(): Generate comprehensive summary
-- compare_documents(): Compare multiple documents
-- get_document_info(): Full document metadata and structure
-- list_all_documents(): List all indexed documents
+Key Principles:
+- Python/Pandas for ALL statistics computation (not LLM)
+- LLM ONLY for reasoning, insights, interpretations
+- Preserves ALL data rows - no deduplication
+- ALWAYS shows visualizations for DATA_QUERY
+- NEVER shows visualizations for other modes
 """
 import requests
 from typing import List, Dict, Any, Optional, Union, Tuple
@@ -49,20 +45,26 @@ except ImportError:
 
 # OpenRouter API configuration - Use environment variable or Streamlit secrets
 import os
-try:
-    import streamlit as st
-    OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", os.environ.get("OPENROUTER_API_KEY", ""))
-except:
-    OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
+def get_api_key():
+    """Get API key from Streamlit secrets or environment."""
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets') and "OPENROUTER_API_KEY" in st.secrets:
+            return st.secrets["OPENROUTER_API_KEY"]
+    except:
+        pass
+    return os.environ.get("OPENROUTER_API_KEY", "")
+
+OPENROUTER_API_KEY = get_api_key()
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL = "openai/gpt-4o-mini"  # Fast model for quick responses
 
-# Performance settings - REDUCED for concise answers
-MAX_CONTEXT_CHARS = 6000  # Reduced - only include relevant context
-MAX_CONTEXT_CHARS_DETAILED = 12000  # For detailed mode
-DEFAULT_MAX_TOKENS = 2000  # Reduced default
-DEFAULT_MAX_TOKENS_DETAILED = 4000  # For detailed mode
+# Performance settings
+MAX_CONTEXT_CHARS = 6000
+MAX_CONTEXT_CHARS_DETAILED = 12000
+DEFAULT_MAX_TOKENS = 2000
+DEFAULT_MAX_TOKENS_DETAILED = 4000
 
 
 # ============================================================================
@@ -79,16 +81,27 @@ CRITICAL RULES:
 5. DO NOT dump entire dataset analysis
 6. If context is huge, extract ONLY the portion relevant to the question
 
+⛔ ANTI-HALLUCINATION GUARDRAILS (ABSOLUTE):
+- NEVER make up data, values, or statistics
+- NEVER estimate or approximate numbers
+- NEVER assume data exists if not shown in context
+- NEVER fill in missing values with guesses
+- If data is unavailable, say: "This data is not available in the dataset"
+- If uncertain, cite ONLY what appears in provided context
+- If asked about something not in the data, DO NOT invent an answer
+
 For metric questions (e.g., "What is oil production?"):
-- State the metric value with units
-- Give a 1-sentence explanation
+- State ONLY the metric value with units from the data
+- Give a 1-sentence explanation based ONLY on provided data
 - That's it. No more.
 
 FORBIDDEN:
 - Full dataset summaries when not asked
 - All columns listing when not asked
 - Multi-section reports for simple questions
-- Statistics for unrelated metrics"""
+- Statistics for unrelated metrics
+- ANY invented, assumed, or estimated values
+- Making up data points, averages, or trends"""
 
 SYSTEM_PROMPT_DETAILED = """You are an expert data analyst providing comprehensive analysis.
 
@@ -191,10 +204,10 @@ def get_target_columns(metrics: List[str], df_columns: List[str]) -> List[str]:
     Get the EXACT columns to use based on detected metrics.
     
     STRICT FILTERING: Only returns columns that match the requested metric.
-    If user asks about gas, ONLY gas columns are returned - no oil, water, etc.
+    If user asks about water production, ONLY water production columns are returned.
     
     Args:
-        metrics: List of detected metric types (e.g., ['gas'], ['oil', 'sales'])
+        metrics: List of detected metric types (e.g., ['gas'], ['water', 'production'])
         df_columns: List of columns in the DataFrame
         
     Returns:
@@ -203,19 +216,12 @@ def get_target_columns(metrics: List[str], df_columns: List[str]) -> List[str]:
     if not metrics:
         return []
     
-    target_patterns = []
-    
-    # Collect all patterns for requested metrics
-    for metric in metrics:
-        if metric in METRIC_COLUMNS:
-            target_patterns.extend(METRIC_COLUMNS[metric])
-    
-    # If both production and a specific resource, filter to that resource's production
+    # Identify specific resources vs generic categories
+    specific_resources = [m for m in metrics if m in ['oil', 'gas', 'water', 'condensate', 'lpg', 'ngl', 'heat', 'energy']]
     has_production = 'production' in metrics
     has_sales = 'sales' in metrics
-    specific_resources = [m for m in metrics if m in ['oil', 'gas', 'water', 'condensate', 'lpg', 'ngl', 'heat', 'energy']]
+    has_injection = 'injection' in metrics
     
-    # Build final column list
     matched_columns = []
     
     for col in df_columns:
@@ -225,28 +231,56 @@ def get_target_columns(metrics: List[str], df_columns: List[str]) -> List[str]:
         if col_upper.endswith('_UOM'):
             continue
         
-        # Check if column matches any target pattern
-        for pattern in target_patterns:
-            if pattern in col_upper:
-                matched_columns.append(col)
-                break
-        else:
-            # Fallback: Check if column contains resource keyword
+        # Skip non-metric columns (no VOL, RATE, etc.)
+        if not any(kw in col_upper for kw in ['VOL', 'RATE', 'ENERGY', 'BTU', 'HEAT']):
+            continue
+        
+        # ====================================================================
+        # CASE 1: Specific resource requested (e.g., water, oil, gas)
+        # ====================================================================
+        if specific_resources:
+            # Column must contain the SPECIFIC resource keyword
+            resource_keywords = {
+                'oil': ['OIL'],
+                'gas': ['GAS'],
+                'water': ['WAT'],  # WAT catches both WAT and WATER
+                'condensate': ['COND'],
+                'lpg': ['LPG'],
+                'ngl': ['NGL'],
+                'heat': ['HEAT'],
+                'energy': ['ENERGY', 'BTU']
+            }
+            
+            col_matches_resource = False
             for resource in specific_resources:
-                resource_patterns = METRIC_COLUMNS.get(resource, [])
-                for pattern in resource_patterns:
-                    # Extract the core resource name (e.g., "OIL" from "PROD_OIL_VOL")
-                    if resource.upper() in col_upper:
-                        # Additional filter: if asking for production/sales, must have that prefix
-                        if has_production and 'PROD' not in col_upper:
-                            continue
-                        if has_sales and 'SALES' not in col_upper:
-                            continue
-                        # Must have VOL or RATE to be a metric column
-                        if 'VOL' in col_upper or 'RATE' in col_upper or 'ENERGY' in col_upper:
-                            if col not in matched_columns:
-                                matched_columns.append(col)
-                        break
+                keywords = resource_keywords.get(resource, [resource.upper()])
+                if any(kw in col_upper for kw in keywords):
+                    col_matches_resource = True
+                    break
+            
+            if not col_matches_resource:
+                continue  # Skip this column - doesn't match requested resource
+            
+            # Additionally filter by production/sales/injection if specified
+            if has_production and 'PROD' not in col_upper:
+                continue
+            if has_sales and 'SALES' not in col_upper:
+                continue
+            if has_injection and 'INJ' not in col_upper:
+                continue
+            
+            matched_columns.append(col)
+        
+        # ====================================================================
+        # CASE 2: Only generic category (production, sales, injection)
+        # ====================================================================
+        elif has_production or has_sales or has_injection:
+            if has_production and 'PROD' in col_upper:
+                matched_columns.append(col)
+            elif has_sales and 'SALES' in col_upper:
+                matched_columns.append(col)
+            elif has_injection and 'INJ' in col_upper:
+                matched_columns.append(col)
     
     return matched_columns
 
@@ -270,6 +304,53 @@ def filter_columns_for_metric(df_columns: List[str], query: str) -> Tuple[List[s
 
 
 # ============================================================================
+# HALLUCINATION PREVENTION & VALIDATION
+# ============================================================================
+
+def validate_response_against_context(response: str, context: str) -> Dict[str, Any]:
+    """
+    Validate that the response does NOT introduce made-up data.
+    
+    Checks for:
+    - Numerical claims not in context
+    - Statistical claims not in context
+    - Invented metrics or data points
+    
+    Args:
+        response: LLM response text
+        context: RAG context provided to LLM
+        
+    Returns:
+        Dict with {'is_valid': bool, 'issues': List[str]}
+    """
+    issues = []
+    
+    # Check for common hallucination patterns
+    hallucination_patterns = [
+        ("approximately", "estimated", "roughly", "about", "around"),  # Estimations
+        ("assumed", "likely", "probably", "probably indicates"),  # Assumptions without data
+        ("would be", "could be", "should be"),  # Speculative
+    ]
+    
+    response_lower = response.lower()
+    context_lower = context.lower()
+    
+    # Flag speculative language in RAG mode
+    for pattern_group in hallucination_patterns:
+        for pattern in pattern_group:
+            if pattern in response_lower and pattern not in context_lower:
+                # Allow some speculation but log it
+                if pattern in ("assumed", "estimated", "roughly", "approximately"):
+                    issues.append(f"⚠️ Response uses '{pattern}' - ensure values are from data")
+    
+    return {
+        "is_valid": len(issues) < 3,  # Allow some warnings but flag many
+        "issues": issues,
+        "needs_review": len(issues) > 0
+    }
+
+
+# ============================================================================
 # LLM API CALL
 # ============================================================================
 
@@ -280,10 +361,16 @@ def call_llm(
     timeout: int = 60
 ) -> str:
     """Call OpenRouter LLM API with error handling - optimized for speed."""
+    # Get API key fresh each time (in case it wasn't available at module load)
+    api_key = get_api_key() or OPENROUTER_API_KEY
+    
+    if not api_key:
+        return "Error: No API key configured. Please set OPENROUTER_API_KEY in .streamlit/secrets.toml"
+    
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:8501",
+        "HTTP-Referer": "http://localhost:8503",
         "X-Title": "RAG Engine"
     }
     
@@ -313,6 +400,796 @@ def call_llm(
         return f"Error communicating with LLM: {str(e)}"
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+# ============================================================================
+# MODE-SPECIFIC HANDLERS (4-MODE SYSTEM) - REWRITTEN
+# ============================================================================
+
+def handle_freeform_query(user_query: str) -> Dict[str, Any]:
+    """
+    Handle FREEFORM_QUERY mode - general chat unrelated to dataset.
+    
+    STRICT MODE: This assistant ONLY answers questions about the uploaded dataset.
+    For any non-dataset questions, it politely refuses and guides the user.
+    
+    Tool: conversational_response()
+    - MUST NOT reference dataset at all
+    - Returns refusal message (no LLM call needed - saves API cost)
+    """
+    refusal_message = """⚠️ **I can only answer questions about your uploaded dataset.**
+
+I'm a specialized data analysis assistant focused on helping you explore and understand your oil & gas production data.
+
+**Examples of questions I can help with:**
+- "What is the total oil production?"
+- "Show me gas production trends"
+- "Compare water injection volumes"
+- "What wells have the highest production?"
+- "Create a chart of monthly production"
+- "What's in this document?"
+
+Please ask a question related to your uploaded data, and I'll be happy to help!"""
+    
+    return {
+        "answer": refusal_message,
+        "sources": [],
+        "intent": "freeform_query",
+        "query_mode": "freeform_query",
+        "detail_mode": "normal",
+        "specific_metrics": [],
+        "target_columns": [],
+        "show_visualizations": False,  # NEVER for freeform
+        "num_chunks": 0,
+        "query_type": "general"
+    }
+
+
+def handle_system_task(user_query: str) -> Dict[str, Any]:
+    """
+    Handle SYSTEM_TASK mode - requests to modify the RAG engine.
+    
+    Tool: system_instruction()
+    - MUST return code fixes, architecture improvements, debugging recommendations
+    """
+    system_message = """🔧 **System Modification Request Detected**
+
+I understand you want to modify or improve the system. Here's what I can offer:
+
+---
+
+## 📋 Current System Architecture
+
+The RAG engine uses a 4-mode routing system:
+1. **DATA_QUERY** → Queries about data (oil, gas, production, etc.)
+2. **DOCUMENT_OVERVIEW** → Full document structure analysis
+3. **FREEFORM_QUERY** → General questions (refused - data only)
+4. **SYSTEM_TASK** → This mode (system modifications)
+
+---
+
+## 🛠️ For System Modifications
+
+To modify this system, you'll need to edit these files:
+
+```
+rag-app/
+├── app.py                    # Streamlit UI
+├── core/
+│   ├── rag_engine.py         # Main RAG logic
+│   ├── query_router.py       # Intent classification
+│   ├── data_engine.py        # Data processing
+│   └── vector_store.py       # FAISS storage
+```
+
+### Common Modifications:
+- **Add new intent**: Edit `query_router.py` → `classify_query_mode()`
+- **Change visualizations**: Edit `app.py` → `render_query()` function
+- **Modify LLM prompts**: Edit `rag_engine.py` → `SYSTEM_PROMPT_*` constants
+- **Change statistics**: Edit `rag_engine.py` → `_handle_calculate_intent()`
+
+---
+
+## 💡 Recommendation
+
+If you want to modify behavior, please specify exactly:
+1. What current behavior needs fixing?
+2. What is the expected behavior?
+3. Which query type is affected?
+
+I can then provide targeted code recommendations.
+
+---
+
+Would you like to ask a data question instead? Try: *"What is oil production?"*"""
+    
+    return {
+        "answer": system_message,
+        "sources": [],
+        "intent": "system_task",
+        "query_mode": "system_task",
+        "detail_mode": "normal",
+        "specific_metrics": [],
+        "target_columns": [],
+        "show_visualizations": False,  # NEVER for system tasks
+        "num_chunks": 0,
+        "query_type": "system"
+    }
+
+
+def handle_document_overview(dataframe: Optional[pd.DataFrame] = None, doc_hash: str = None, user_query: str = "") -> Dict[str, Any]:
+    """
+    Handle DOCUMENT_OVERVIEW mode - complete dataset breakdown or executive summary.
+    
+    Tool: dataset_overview()
+    - MUST return: rows, columns, categories, numeric/text counts, date ranges,
+      missing-value analysis, production/sales column groups
+    - OR: Executive summary with business insights if requested
+    """
+    if dataframe is None or dataframe.empty:
+        return {
+            "answer": "📭 **No document loaded.** Please upload a document first to see its overview.",
+            "sources": [],
+            "intent": "document_overview",
+            "query_mode": "document_overview",
+            "detail_mode": "detailed",
+            "specific_metrics": [],
+            "target_columns": [],
+            "show_visualizations": False,  # NEVER for overview
+            "num_chunks": 0,
+            "query_type": "data"
+        }
+    
+    df = dataframe
+    q_lower = user_query.lower()
+    
+    # ========================================================================
+    # CHECK IF USER WANTS EXECUTIVE SUMMARY vs TECHNICAL OVERVIEW
+    # ========================================================================
+    is_executive_summary = any(phrase in q_lower for phrase in [
+        "executive summary", "exec summary", "high level summary", "high-level summary",
+        "brief summary", "quick summary", "business summary", "management summary",
+        "summary of this", "give me a summary", "provide a summary", "summarize"
+    ])
+    
+    if is_executive_summary:
+        return _generate_executive_summary(df)
+    
+    # ========================================================================
+    # BUILD COMPREHENSIVE DATASET OVERVIEW (Technical)
+    # ========================================================================
+    overview_parts = []
+    
+    # 📘 Header
+    overview_parts.append("## 📘 Complete Dataset Overview\n")
+    
+    # ========================================================================
+    # 1. BASIC SHAPE
+    # ========================================================================
+    overview_parts.append("### 📐 Dataset Shape")
+    overview_parts.append(f"| Metric | Value |")
+    overview_parts.append(f"|--------|-------|")
+    overview_parts.append(f"| **Total Rows** | {len(df):,} |")
+    overview_parts.append(f"| **Total Columns** | {len(df.columns)} |")
+    overview_parts.append(f"| **Memory Usage** | {df.memory_usage(deep=True).sum() / (1024*1024):.2f} MB |")
+    overview_parts.append("")
+    
+    # ========================================================================
+    # 2. COLUMN TYPE BREAKDOWN
+    # ========================================================================
+    numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
+    text_cols = df.select_dtypes(include=['object']).columns.tolist()
+    date_cols = []
+    
+    # Detect date columns
+    for col in df.columns:
+        if 'date' in col.lower() or 'time' in col.lower():
+            try:
+                pd.to_datetime(df[col].dropna().head(10), errors='coerce')
+                date_cols.append(col)
+            except:
+                pass
+    
+    overview_parts.append("### 📊 Column Categories")
+    overview_parts.append(f"| Category | Count |")
+    overview_parts.append(f"|----------|-------|")
+    overview_parts.append(f"| Numeric Columns | {len(numeric_cols)} |")
+    overview_parts.append(f"| Text/Categorical Columns | {len(text_cols)} |")
+    overview_parts.append(f"| Date/Time Columns | {len(date_cols)} |")
+    overview_parts.append("")
+    
+    # ========================================================================
+    # 3. PRODUCTION & SALES COLUMN GROUPS
+    # ========================================================================
+    prod_cols = [c for c in df.columns if 'PROD' in c.upper() and any(x in c.upper() for x in ['VOL', 'VOLUME'])]
+    sales_cols = [c for c in df.columns if 'SALES' in c.upper() and any(x in c.upper() for x in ['VOL', 'VOLUME'])]
+    inj_cols = [c for c in df.columns if 'INJ' in c.upper() and any(x in c.upper() for x in ['VOL', 'VOLUME'])]
+    
+    overview_parts.append("### 🛢️ Metric Column Groups")
+    
+    if prod_cols:
+        overview_parts.append(f"\n**Production Columns ({len(prod_cols)}):**")
+        for col in prod_cols[:8]:
+            try:
+                total = pd.to_numeric(df[col], errors='coerce').dropna().sum()
+                uom = ""
+                if col + "_UOM" in df.columns:
+                    uom_vals = df[col + "_UOM"].dropna()
+                    uom = f" {uom_vals.iloc[0]}" if len(uom_vals) > 0 else ""
+                overview_parts.append(f"- `{col}`: Total = {total:,.2f}{uom}")
+            except:
+                overview_parts.append(f"- `{col}`: (non-numeric)")
+    
+    if sales_cols:
+        overview_parts.append(f"\n**Sales Columns ({len(sales_cols)}):**")
+        for col in sales_cols[:8]:
+            try:
+                total = pd.to_numeric(df[col], errors='coerce').dropna().sum()
+                uom = ""
+                if col + "_UOM" in df.columns:
+                    uom_vals = df[col + "_UOM"].dropna()
+                    uom = f" {uom_vals.iloc[0]}" if len(uom_vals) > 0 else ""
+                overview_parts.append(f"- `{col}`: Total = {total:,.2f}{uom}")
+            except:
+                overview_parts.append(f"- `{col}`: (non-numeric)")
+    
+    if inj_cols:
+        overview_parts.append(f"\n**Injection Columns ({len(inj_cols)}):**")
+        for col in inj_cols[:5]:
+            try:
+                total = pd.to_numeric(df[col], errors='coerce').dropna().sum()
+                overview_parts.append(f"- `{col}`: Total = {total:,.2f}")
+            except:
+                overview_parts.append(f"- `{col}`: (non-numeric)")
+    
+    overview_parts.append("")
+    
+    # ========================================================================
+    # 4. DATE RANGES
+    # ========================================================================
+    if date_cols:
+        overview_parts.append("### 📅 Date Ranges")
+        for col in date_cols[:3]:
+            try:
+                dates = pd.to_datetime(df[col], errors='coerce').dropna()
+                if len(dates) > 0:
+                    overview_parts.append(f"- **{col}:** {dates.min().strftime('%Y-%m-%d')} to {dates.max().strftime('%Y-%m-%d')}")
+                    days = (dates.max() - dates.min()).days
+                    overview_parts.append(f"  - Duration: {days} days ({days//30} months)")
+            except:
+                pass
+        overview_parts.append("")
+    
+    # ========================================================================
+    # 5. MISSING VALUES ANALYSIS
+    # ========================================================================
+    overview_parts.append("### 📋 Missing Values Analysis")
+    missing = df.isnull().sum()
+    total_missing = missing.sum()
+    total_cells = df.size
+    completeness = ((total_cells - total_missing) / total_cells * 100) if total_cells > 0 else 0
+    
+    overview_parts.append(f"- **Overall Completeness:** {completeness:.1f}%")
+    overview_parts.append(f"- **Total Missing Cells:** {total_missing:,} / {total_cells:,}")
+    
+    # Top columns with missing values
+    missing_cols = missing[missing > 0].sort_values(ascending=False).head(10)
+    if len(missing_cols) > 0:
+        overview_parts.append("\n**Top Columns with Missing Values:**")
+        overview_parts.append("| Column | Missing | % Missing |")
+        overview_parts.append("|--------|---------|-----------|")
+        for col, count in missing_cols.items():
+            pct = (count / len(df) * 100)
+            overview_parts.append(f"| {col[:30]} | {count:,} | {pct:.1f}% |")
+    overview_parts.append("")
+    
+    # ========================================================================
+    # 6. KEY FIELDS (UNIQUE COUNTS)
+    # ========================================================================
+    overview_parts.append("### 🔍 Key Fields")
+    key_candidates = [c for c in df.columns if any(kw in c.lower() for kw in ['name', 'id', 'well', 'field', 'item', 'type', 'status'])]
+    
+    if key_candidates:
+        overview_parts.append("| Field | Unique Values | Sample Values |")
+        overview_parts.append("|-------|---------------|---------------|")
+        for col in key_candidates[:8]:
+            unique_count = df[col].nunique()
+            sample_vals = df[col].dropna().head(3).tolist()
+            sample_str = ", ".join(str(v)[:20] for v in sample_vals)
+            overview_parts.append(f"| {col[:25]} | {unique_count:,} | {sample_str} |")
+    overview_parts.append("")
+    
+    # ========================================================================
+    # 7. NUMERIC SUMMARY STATISTICS
+    # ========================================================================
+    if numeric_cols:
+        overview_parts.append("### 📈 Numeric Column Summary")
+        
+        # Only show key production/sales columns
+        key_numeric = [c for c in numeric_cols if any(x in c.upper() for x in ['PROD', 'SALES', 'INJ', 'VOL', 'ENERGY'])][:10]
+        
+        if key_numeric:
+            overview_parts.append("| Column | Total | Average | Min | Max |")
+            overview_parts.append("|--------|-------|---------|-----|-----|")
+            for col in key_numeric:
+                try:
+                    data = pd.to_numeric(df[col], errors='coerce').dropna()
+                    if len(data) > 0:
+                        total = data.sum()
+                        avg = data.mean()
+                        min_val = data.min()
+                        max_val = data.max()
+                        overview_parts.append(f"| {col[:25]} | {total:,.2f} | {avg:,.2f} | {min_val:,.2f} | {max_val:,.2f} |")
+                except:
+                    overview_parts.append(f"| {col[:25]} | N/A | N/A | N/A | N/A |")
+    
+    overview_parts.append("")
+    
+    # ========================================================================
+    # 8. DATA QUALITY NOTES
+    # ========================================================================
+    overview_parts.append("### 💡 Data Quality Notes")
+    
+    # Completely empty columns
+    empty_cols = [c for c in df.columns if df[c].isna().all()]
+    if empty_cols:
+        overview_parts.append(f"- ⚠️ **{len(empty_cols)} completely empty column(s):** {', '.join(empty_cols[:5])}")
+    
+    # Columns with >50% missing
+    high_missing = [c for c in df.columns if df[c].isna().sum() / len(df) > 0.5]
+    if high_missing:
+        overview_parts.append(f"- ⚠️ **{len(high_missing)} column(s) with >50% missing data**")
+    
+    # Duplicate rows check
+    dup_count = df.duplicated().sum()
+    if dup_count > 0:
+        overview_parts.append(f"- ⚠️ **{dup_count:,} duplicate rows detected**")
+    else:
+        overview_parts.append("- ✅ No duplicate rows detected")
+    
+    overview_parts.append("")
+    overview_parts.append("---")
+    overview_parts.append("*Use specific questions like 'Show me oil production' to explore the data in detail.*")
+    
+    answer = "\n".join(overview_parts)
+    
+    return {
+        "answer": answer,
+        "sources": [],
+        "intent": "document_overview",
+        "query_mode": "document_overview",
+        "detail_mode": "detailed",
+        "specific_metrics": [],
+        "target_columns": list(df.columns),
+        "show_visualizations": False,  # NEVER for overview
+        "num_chunks": 0,
+        "query_type": "data"
+    }
+
+
+def _generate_executive_summary(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Generate a business-focused executive summary of the dataset.
+    This is a high-level summary suitable for management/stakeholders.
+    """
+    summary_parts = []
+    
+    # ========================================================================
+    # HEADER
+    # ========================================================================
+    summary_parts.append("## 📋 Executive Summary\n")
+    
+    # ========================================================================
+    # 1. DOCUMENT OVERVIEW (2-3 sentences)
+    # ========================================================================
+    summary_parts.append("### 📄 Document Overview")
+    
+    # Detect date range
+    date_range_str = ""
+    date_cols = [c for c in df.columns if 'DATE' in c.upper() or 'TIME' in c.upper()]
+    for col in date_cols[:1]:
+        try:
+            dates = pd.to_datetime(df[col], errors='coerce').dropna()
+            if len(dates) > 0:
+                start_date = dates.min().strftime('%B %d, %Y')
+                end_date = dates.max().strftime('%B %d, %Y')
+                date_range_str = f" covering the period from **{start_date}** to **{end_date}**"
+                break
+        except:
+            pass
+    
+    summary_parts.append(
+        f"This dataset contains **{len(df):,} records** across **{len(df.columns)} data fields**{date_range_str}. "
+        f"The data represents operational metrics including production volumes, sales figures, and related measurements.\n"
+    )
+    
+    # ========================================================================
+    # 2. KEY METRICS SUMMARY
+    # ========================================================================
+    summary_parts.append("### 📊 Key Performance Metrics\n")
+    
+    # Find production columns
+    prod_cols = [c for c in df.columns if 'PROD' in c.upper() and 'VOL' in c.upper()]
+    sales_cols = [c for c in df.columns if 'SALES' in c.upper() and 'VOL' in c.upper()]
+    
+    # Build metrics table
+    metrics_table = []
+    metrics_table.append("| Metric | Total Volume | Average | Unit |")
+    metrics_table.append("|--------|--------------|---------|------|")
+    
+    key_metrics_found = 0
+    
+    # Process production columns
+    for col in prod_cols[:5]:
+        try:
+            data = pd.to_numeric(df[col], errors='coerce').dropna()
+            if len(data) > 0 and data.sum() > 0:
+                total = data.sum()
+                avg = data.mean()
+                
+                # Get unit
+                uom = "units"
+                if col + "_UOM" in df.columns:
+                    uom_vals = df[col + "_UOM"].dropna()
+                    uom = uom_vals.iloc[0] if len(uom_vals) > 0 else "units"
+                
+                # Clean column name for display
+                display_name = col.replace("PROD_", "").replace("_VOL", "").replace("_", " ").title()
+                metrics_table.append(f"| {display_name} Production | {total:,.2f} | {avg:,.2f} | {uom} |")
+                key_metrics_found += 1
+        except:
+            pass
+    
+    # Process sales columns
+    for col in sales_cols[:3]:
+        try:
+            data = pd.to_numeric(df[col], errors='coerce').dropna()
+            if len(data) > 0 and data.sum() > 0:
+                total = data.sum()
+                avg = data.mean()
+                
+                uom = "units"
+                if col + "_UOM" in df.columns:
+                    uom_vals = df[col + "_UOM"].dropna()
+                    uom = uom_vals.iloc[0] if len(uom_vals) > 0 else "units"
+                
+                display_name = col.replace("SALES_", "").replace("_VOL", "").replace("_", " ").title()
+                metrics_table.append(f"| {display_name} Sales | {total:,.2f} | {avg:,.2f} | {uom} |")
+                key_metrics_found += 1
+        except:
+            pass
+    
+    if key_metrics_found > 0:
+        summary_parts.extend(metrics_table)
+        summary_parts.append("")
+    else:
+        # Fallback to any numeric columns
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        key_numeric = [c for c in numeric_cols if not c.endswith('_UOM')][:5]
+        if key_numeric:
+            summary_parts.append("| Metric | Total | Average |")
+            summary_parts.append("|--------|-------|---------|")
+            for col in key_numeric:
+                try:
+                    data = pd.to_numeric(df[col], errors='coerce').dropna()
+                    if len(data) > 0:
+                        summary_parts.append(f"| {col[:30]} | {data.sum():,.2f} | {data.mean():,.2f} |")
+                except:
+                    pass
+            summary_parts.append("")
+    
+    # ========================================================================
+    # 3. KEY HIGHLIGHTS (Business insights)
+    # ========================================================================
+    summary_parts.append("### 💡 Key Highlights\n")
+    
+    highlights = []
+    
+    # Find the largest production metric
+    max_prod_col = None
+    max_prod_val = 0
+    for col in prod_cols[:5]:
+        try:
+            data = pd.to_numeric(df[col], errors='coerce').dropna()
+            if len(data) > 0 and data.sum() > max_prod_val:
+                max_prod_val = data.sum()
+                max_prod_col = col
+        except:
+            pass
+    
+    if max_prod_col:
+        display_name = max_prod_col.replace("PROD_", "").replace("_VOL", "").replace("_", " ").title()
+        uom = "units"
+        if max_prod_col + "_UOM" in df.columns:
+            uom_vals = df[max_prod_col + "_UOM"].dropna()
+            uom = uom_vals.iloc[0] if len(uom_vals) > 0 else "units"
+        highlights.append(f"- **Largest Production Volume:** {display_name} with **{max_prod_val:,.2f} {uom}** total")
+    
+    # Data completeness
+    total_cells = df.size
+    missing_cells = df.isnull().sum().sum()
+    completeness = ((total_cells - missing_cells) / total_cells * 100) if total_cells > 0 else 0
+    highlights.append(f"- **Data Completeness:** {completeness:.1f}% of all data fields are populated")
+    
+    # Number of unique items/wells if available
+    key_id_cols = [c for c in df.columns if any(kw in c.lower() for kw in ['item_name', 'well', 'facility', 'asset'])]
+    if key_id_cols:
+        unique_count = df[key_id_cols[0]].nunique()
+        col_name = key_id_cols[0].replace("_", " ").title()
+        highlights.append(f"- **Unique {col_name}s:** {unique_count:,} distinct entries in the dataset")
+    
+    # Date span
+    if date_range_str:
+        for col in date_cols[:1]:
+            try:
+                dates = pd.to_datetime(df[col], errors='coerce').dropna()
+                if len(dates) > 0:
+                    days = (dates.max() - dates.min()).days
+                    months = days // 30
+                    highlights.append(f"- **Time Span:** {months} months ({days:,} days) of operational data")
+                    break
+            except:
+                pass
+    
+    summary_parts.extend(highlights)
+    summary_parts.append("")
+    
+    # ========================================================================
+    # 4. DATA QUALITY NOTES (Brief)
+    # ========================================================================
+    summary_parts.append("### ⚠️ Data Quality Notes\n")
+    
+    quality_notes = []
+    
+    # Empty columns
+    empty_cols = [c for c in df.columns if df[c].isna().all()]
+    if empty_cols:
+        quality_notes.append(f"- {len(empty_cols)} column(s) contain no data and may need review")
+    
+    # High missing columns
+    high_missing = [c for c in df.columns if df[c].isna().sum() / len(df) > 0.5]
+    if high_missing:
+        quality_notes.append(f"- {len(high_missing)} column(s) have more than 50% missing values")
+    
+    # Duplicates
+    dup_count = df.duplicated().sum()
+    if dup_count > 0:
+        quality_notes.append(f"- {dup_count:,} potential duplicate records identified")
+    
+    if quality_notes:
+        summary_parts.extend(quality_notes)
+    else:
+        summary_parts.append("- ✅ No significant data quality issues detected")
+    
+    summary_parts.append("")
+    
+    # ========================================================================
+    # 5. RECOMMENDATIONS
+    # ========================================================================
+    summary_parts.append("### 📌 Suggested Analysis\n")
+    summary_parts.append("Based on this dataset, consider exploring:")
+    summary_parts.append("- **Trend Analysis:** Production/sales patterns over time")
+    summary_parts.append("- **Performance Comparison:** Metrics across different items/facilities")
+    summary_parts.append("- **Anomaly Detection:** Unusual spikes or drops in key metrics")
+    summary_parts.append("")
+    summary_parts.append("---")
+    summary_parts.append("*Ask specific questions like 'Show oil production trends' or 'Compare gas and water volumes' for detailed analysis.*")
+    
+    answer = "\n".join(summary_parts)
+    
+    return {
+        "answer": answer,
+        "sources": [],
+        "intent": "document_overview",
+        "query_mode": "document_overview",
+        "detail_mode": "detailed",
+        "specific_metrics": [],
+        "target_columns": list(df.columns),
+        "show_visualizations": False,  # No charts for executive summary
+        "num_chunks": 0,
+        "query_type": "data"
+    }
+
+
+def handle_data_query(
+    user_query: str,
+    dataframe: Optional[pd.DataFrame],
+    context: str,
+    doc_hash: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Handle DATA_QUERY mode - the main data analysis path.
+    
+    Tools: query_data() + generate_visuals() (ALWAYS BOTH)
+    
+    MUST RETURN:
+    - 📊 Summary block
+    - 🔢 Statistics (total, avg, min, max, count)
+    - 📈 Visuals (flag for app.py to render)
+    - 💡 Interpretation
+    """
+    df = dataframe
+    
+    # Detect metrics and detail mode
+    from core.query_router import get_requested_metrics
+    specific_metrics = get_requested_metrics(user_query)
+    detail_mode = detect_detail_mode(user_query)
+    
+    # Get target columns based on metrics
+    target_columns = []
+    if specific_metrics and df is not None:
+        target_columns = get_target_columns(specific_metrics, df.columns.tolist())
+    
+    # ========================================================================
+    # COMPUTE STATISTICS (ALWAYS - Python-based)
+    # ========================================================================
+    stats_block = ""
+    if df is not None and not df.empty:
+        stats_block = compute_data_statistics(df, specific_metrics, target_columns)
+    
+    # ========================================================================
+    # GENERATE LLM ANSWER
+    # ========================================================================
+    # Build prompt with statistics
+    is_detailed = (detail_mode == "detailed")
+    
+    if is_detailed:
+        system_prompt = SYSTEM_PROMPT_DETAILED
+        max_tokens = 3000
+    else:
+        system_prompt = SYSTEM_PROMPT_CONCISE
+        max_tokens = 1500
+    
+    user_prompt = f"""Answer this data question:
+{user_query}
+
+PRE-COMPUTED STATISTICS (USE THESE - already calculated by Python):
+{stats_block}
+
+ADDITIONAL CONTEXT:
+{context[:4000]}
+
+RULES:
+- Use the EXACT values from statistics above
+- DO NOT make up numbers
+- Include a brief interpretation
+- If user asked about specific metric, focus on that metric only"""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    answer = call_llm(messages, max_tokens=max_tokens)
+    
+    return {
+        "answer": answer,
+        "sources": [],
+        "intent": "data_query",
+        "query_mode": "data_query",
+        "detail_mode": detail_mode,
+        "specific_metrics": specific_metrics,
+        "target_columns": target_columns,
+        "show_visualizations": True,  # ALWAYS for data queries
+        "num_chunks": 0,
+        "query_type": "data",
+        "stats_block": stats_block  # Pass stats for display
+    }
+
+
+def compute_data_statistics(
+    df: pd.DataFrame, 
+    specific_metrics: List[str],
+    target_columns: List[str]
+) -> str:
+    """
+    Compute ACTUAL statistics from DataFrame.
+    Returns formatted string with total, avg, min, max, count.
+    Includes comparison section when multiple metrics are requested.
+    """
+    if df is None or df.empty:
+        return "No data available."
+    
+    stats_lines = []
+    stats_lines.append("## 📊 Computed Statistics\n")
+    stats_lines.append(f"**Dataset Size:** {len(df):,} rows × {len(df.columns)} columns\n")
+    
+    # Track metric totals for comparison
+    metric_totals = {}
+    
+    # If we have target columns, compute their stats
+    if target_columns:
+        stats_lines.append("### Requested Metric Statistics:")
+        stats_lines.append("| Column | Total | Average | Min | Max | Count |")
+        stats_lines.append("|--------|-------|---------|-----|-----|-------|")
+        
+        for col in target_columns[:10]:  # Limit to 10 columns
+            try:
+                data = pd.to_numeric(df[col], errors='coerce').dropna()
+                if len(data) > 0:
+                    total = data.sum()
+                    avg = data.mean()
+                    min_val = data.min()
+                    max_val = data.max()
+                    count = len(data)
+                    
+                    # Get unit
+                    uom = ""
+                    if col + "_UOM" in df.columns:
+                        uom_vals = df[col + "_UOM"].dropna()
+                        uom = f" {uom_vals.iloc[0]}" if len(uom_vals) > 0 else ""
+                    
+                    stats_lines.append(
+                        f"| {col[:30]} | {total:,.2f}{uom} | {avg:,.2f}{uom} | "
+                        f"{min_val:,.2f} | {max_val:,.2f} | {count:,} |"
+                    )
+                    
+                    # Track for comparison
+                    metric_totals[col] = {"total": total, "avg": avg, "unit": uom}
+            except Exception:
+                pass
+        stats_lines.append("")
+        
+        # Add comparison section if multiple metrics requested
+        if len(specific_metrics) >= 2 and len(metric_totals) >= 2:
+            stats_lines.append("### 📊 Metric Comparison:")
+            stats_lines.append("| Metric | Total Volume | % of Combined |")
+            stats_lines.append("|--------|--------------|---------------|")
+            
+            combined_total = sum(m["total"] for m in metric_totals.values())
+            for col, data in metric_totals.items():
+                pct = (data["total"] / combined_total * 100) if combined_total > 0 else 0
+                stats_lines.append(f"| {col[:25]} | {data['total']:,.2f}{data['unit']} | {pct:.1f}% |")
+            
+            stats_lines.append(f"\n**Combined Total:** {combined_total:,.2f}")
+            
+            # Add which metric is larger
+            if len(metric_totals) >= 2:
+                sorted_metrics = sorted(metric_totals.items(), key=lambda x: x[1]["total"], reverse=True)
+                largest = sorted_metrics[0]
+                smallest = sorted_metrics[-1]
+                if largest[1]["total"] > 0 and smallest[1]["total"] > 0:
+                    ratio = largest[1]["total"] / smallest[1]["total"]
+                    stats_lines.append(f"\n**Comparison:** {largest[0]} is {ratio:.1f}x larger than {smallest[0]}")
+            stats_lines.append("")
+    else:
+        # Fall back to key production columns
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        key_cols = [c for c in numeric_cols if any(x in c.upper() for x in ['PROD', 'SALES', 'VOL', 'ENERGY'])][:8]
+        
+        if key_cols:
+            stats_lines.append("### Key Metric Statistics:")
+            stats_lines.append("| Column | Total | Average | Min | Max | Count |")
+            stats_lines.append("|--------|-------|---------|-----|-----|-------|")
+            
+            for col in key_cols:
+                try:
+                    data = pd.to_numeric(df[col], errors='coerce').dropna()
+                    if len(data) > 0:
+                        total = data.sum()
+                        avg = data.mean()
+                        min_val = data.min()
+                        max_val = data.max()
+                        count = len(data)
+                        stats_lines.append(
+                            f"| {col[:30]} | {total:,.2f} | {avg:,.2f} | "
+                            f"{min_val:,.2f} | {max_val:,.2f} | {count:,} |"
+                        )
+                except Exception:
+                    pass
+            stats_lines.append("")
+    
+    # Date range if available
+    date_cols = [c for c in df.columns if 'DATE' in c.upper() or 'TIME' in c.upper()]
+    for col in date_cols[:1]:
+        try:
+            dates = pd.to_datetime(df[col], errors='coerce').dropna()
+            if len(dates) > 0:
+                stats_lines.append(f"**Date Range:** {dates.min().strftime('%Y-%m-%d')} to {dates.max().strftime('%Y-%m-%d')}")
+        except:
+            pass
+    
+    return "\n".join(stats_lines)
 
 
 # ============================================================================
@@ -1054,7 +1931,7 @@ def get_dataframe_for_doc(doc_hash: str, filename: str = None) -> Optional[pd.Da
 
 
 # ============================================================================
-# MAIN QUERY FUNCTION
+# MAIN QUERY FUNCTION (REWRITTEN FOR 4-MODE SYSTEM)
 # ============================================================================
 
 def query(
@@ -1064,14 +1941,13 @@ def query(
     dataframe: Optional[pd.DataFrame] = None
 ) -> Dict[str, Any]:
     """
-    Main unified query function with intelligent intent detection.
+    Main unified query function with 4-MODE intelligent routing.
     
-    This function:
-    1. Detects query complexity (simple vs detailed)
-    2. Detects specific metrics being asked about
-    3. For calculations with DataFrame: Uses Python directly (FAST, no LLM)
-    4. For simple questions: Returns CONCISE answers
-    5. For detailed requests: Returns comprehensive analysis
+    ROUTING LOGIC (STRICT PRIORITY ORDER):
+    1. FREEFORM_QUERY → conversational_response() → Refuse
+    2. SYSTEM_TASK → system_instruction() → Guidance
+    3. DOCUMENT_OVERVIEW → dataset_overview() → Full breakdown
+    4. DATA_QUERY → query_data() + generate_visuals() → Stats + Charts
     
     Args:
         user_query: User's natural language query
@@ -1080,92 +1956,61 @@ def query(
         dataframe: Optional DataFrame for direct statistics computation
         
     Returns:
-        Dict with answer, sources, intent, and metadata
+        Dict with answer, sources, intent, show_visualizations, and metadata
     """
-    # Detect question complexity and specific metrics
-    detail_mode = detect_detail_mode(user_query)  # Returns "detailed", "normal", or "short"
-    specific_metrics = detect_specific_metrics(user_query)
-    simple_question = is_simple_question(user_query)
+    # ========================================================================
+    # STEP 1: QUERY MODE CLASSIFICATION (4 MODES)
+    # ========================================================================
+    from core.query_router import classify_query_mode, QueryMode, get_requested_metrics
     
-    # Detect intent
-    intent = detect_intent(user_query)
+    # Pass DataFrame columns to help classification
+    df_columns = list(dataframe.columns) if dataframe is not None else []
+    mode, confidence, reason = classify_query_mode(user_query, df_columns)
     
     # ========================================================================
-    # DYNAMIC K-VALUE ADJUSTMENT BASED ON DETAIL MODE
+    # MODE 1: FREEFORM_QUERY - Refuse non-dataset questions
     # ========================================================================
-    if detail_mode == "detailed":
-        k = max(k, 15)  # More chunks for detailed answers
-    elif detail_mode == "short":
-        k = min(k, 3)   # Fewer chunks for short/brief answers
-    elif simple_question:
-        k = min(k, 5)   # Limited chunks for simple questions
-    # else: use default k for normal mode
+    if mode == QueryMode.FREEFORM_QUERY:
+        return handle_freeform_query(user_query)
     
     # ========================================================================
-    # GENERAL OVERVIEW: No specific resource mentioned -> NO VISUALIZATIONS
+    # MODE 2: SYSTEM_TASK - Return system modification guidance
     # ========================================================================
-    if intent == "general_overview" and dataframe is not None and not dataframe.empty:
-        # Get vector chunks for dynamic summary generation
-        store = get_vector_store()
-        query_embedding = embed_query(user_query)
-        chunks = store.search_with_context(query_embedding, k=k, context_window=1, doc_hash=doc_hash)
-        
-        # Generate dynamic summary based on detail mode and chunks
-        answer = generate_dynamic_summary(dataframe, detail_mode, chunks)
-        return {
-            "answer": answer,
-            "sources": [],
-            "intent": "general_overview",  # This tells app.py to NOT show charts
-            "detail_mode": detail_mode,
-            "specific_metrics": [],  # Empty = no specific metrics
-            "target_columns": [],    # Empty = no charts
-            "show_visualizations": False,  # Explicit flag
-            "num_chunks": len(chunks) if chunks else 0
-        }
+    if mode == QueryMode.SYSTEM_TASK:
+        return handle_system_task(user_query)
     
-    # Additional adjustment for simple metric questions
-    if simple_question and detail_mode == "normal":
-        k = min(k, 3)  # Only 3 chunks for simple questions
+    # ========================================================================
+    # MODE 3: DOCUMENT_OVERVIEW - Full dataset breakdown or Executive Summary
+    # ========================================================================
+    if mode == QueryMode.DOCUMENT_OVERVIEW:
+        return handle_document_overview(dataframe, doc_hash, user_query)
     
-    # FAST PATH: If calculate intent and we have DataFrame, skip vector search entirely
-    if intent == "calculate" and dataframe is not None and not dataframe.empty:
-        # Get target columns for this metric
+    # ========================================================================
+    # MODE 4: DATA_QUERY - Full RAG pipeline with visualizations
+    # ========================================================================
+    
+    # Detect question parameters
+    detail_mode = detect_detail_mode(user_query)
+    specific_metrics = get_requested_metrics(user_query)
+    
+    # Get target columns for visualization filtering
+    target_columns = []
+    if specific_metrics and dataframe is not None:
         target_columns = get_target_columns(specific_metrics, dataframe.columns.tolist())
-        answer = _handle_calculate_intent(user_query, "", doc_hash, dataframe, detail_mode, specific_metrics)
-        return {
-            "answer": answer,
-            "sources": [],
-            "intent": intent,
-            "detail_mode": detail_mode,
-            "specific_metrics": specific_metrics,
-            "target_columns": target_columns,
-            "show_visualizations": len(specific_metrics) > 0,  # Only if specific metric asked
-            "num_chunks": 0
-        }
     
-    # SIMPLE METRIC QUESTION: Direct Python answer, no LLM needed
-    if simple_question and specific_metrics and dataframe is not None and not dataframe.empty:
-        # Get target columns for this metric
-        target_columns = get_target_columns(specific_metrics, dataframe.columns.tolist())
-        answer = _handle_simple_metric_question(user_query, dataframe, specific_metrics)
-        if answer:  # If we got a good answer
-            return {
-                "answer": answer,
-                "sources": [],
-                "intent": "metric_lookup",
-                "detail_mode": False,
-                "specific_metrics": specific_metrics,
-                "target_columns": target_columns,
-                "show_visualizations": True,  # Specific metric = show charts
-                "num_chunks": 0
-            }
-    
-    # NORMAL PATH: Vector search for other intents
+    # ========================================================================
+    # STEP 2: RETRIEVE CONTEXT FROM VECTOR STORE
+    # ========================================================================
     store = get_vector_store()
+    
+    # Adjust k based on detail mode
+    if detail_mode == "detailed":
+        k = max(k, 15)
+    elif detail_mode == "brief":
+        k = min(k, 5)
     
     # Get relevant context
     query_embedding = embed_query(user_query)
-    
     results = store.search_with_context(
         query_embedding,
         k=k,
@@ -1178,71 +2023,84 @@ def query(
     if results:
         filename = results[0].get("filename")
     
-    # Try to get DataFrame for pre-computed stats
+    # Try to get DataFrame if not provided
     df = dataframe
     if df is None and filename:
         df = get_dataframe_for_doc(doc_hash, filename)
     
-    # If specific document and no results, get full doc
-    if doc_hash and not results:
-        full_text = store.get_full_document_text(doc_hash)
-        if full_text:
-            results = [{
-                "text": full_text,
-                "filename": "document",
-                "doc_hash": doc_hash,
-                "score": 1.0
-            }]
+    # Build context string
+    context = build_structured_context(results, doc_hash, max_chars=MAX_CONTEXT_CHARS)
     
-    if not results:
-        return {
-            "answer": "No relevant information found. Please upload a document first or try a different query.",
-            "sources": [],
-            "intent": "no_data"
-        }
+    # ========================================================================
+    # STEP 3: COMPUTE STATISTICS (Python-based, NOT LLM)
+    # ========================================================================
+    stats_block = ""
+    if df is not None and not df.empty:
+        stats_block = compute_data_statistics(df, specific_metrics, target_columns)
+        # Prepend stats to context
+        context = stats_block + "\n\n---\n\n" + context
     
-    # Build context - adjust size based on detail mode
+    # ========================================================================
+    # STEP 4: GENERATE LLM ANSWER
+    # ========================================================================
     is_detailed = (detail_mode == "detailed")
-    max_context = MAX_CONTEXT_CHARS_DETAILED if is_detailed else MAX_CONTEXT_CHARS
-    context = build_structured_context(results, doc_hash, max_chars=max_context)
     
-    # For simple questions with specific metrics, use focused stats only
-    if simple_question and specific_metrics and df is not None:
-        focused_stats = get_metric_specific_stats(df, specific_metrics)
-        if focused_stats:
-            context = focused_stats + "\n\n" + context[:2000]  # Limited context
-    elif df is not None:
-        stats = compute_stats_for_query(df, user_query)
-        if stats:
-            context = stats + "\n\n---\n\n" + context[:max_context - len(stats) - 100]
-    
-    # Handle different intents with appropriate strategies
-    # Pass detail_mode and specific_metrics to handlers
-    if intent == "show":
-        answer = _handle_show_intent(user_query, context, doc_hash, detail_mode)
-    elif intent == "calculate":
-        answer = _handle_calculate_intent(user_query, context, doc_hash, df, detail_mode, specific_metrics)
-    elif intent == "explain":
-        answer = _handle_explain_intent(user_query, context, df, detail_mode, specific_metrics)
-    elif intent == "summarize":
-        answer = _handle_summarize_intent(user_query, context, df, detail_mode)
-    elif intent == "search":
-        answer = _handle_search_intent(user_query, context)
-    elif intent == "trend":
-        answer = _handle_trend_intent(user_query, context, doc_hash)
-    elif intent == "anomaly":
-        answer = _handle_anomaly_intent(user_query, context, doc_hash)
+    if is_detailed:
+        system_prompt = SYSTEM_PROMPT_DETAILED
+        max_tokens = 3000
     else:
-        answer = _handle_general_intent(user_query, context, detail_mode, specific_metrics)
+        system_prompt = SYSTEM_PROMPT_CONCISE
+        max_tokens = 1500
     
-    # POST-PROCESSING: Compress answer if too long for simple/short questions
-    if detail_mode == "short" or (detail_mode == "normal" and simple_question):
-        word_count = len(answer.split())
-        max_words = 80 if detail_mode == "short" else 150
-        if word_count > max_words:
-            answer = compress_answer(answer, max_words=max_words)
+    # Build user prompt
+    metric_focus = ""
+    if specific_metrics:
+        metric_focus = f"\n\n**FOCUS ON:** {', '.join(specific_metrics).upper()} metrics only."
     
-    # Format sources for return
+    # Check if we have actual statistics
+    has_stats = stats_block and len(stats_block) > 100
+    
+    if has_stats:
+        user_prompt = f"""Answer this data question using the COMPUTED STATISTICS below:
+{user_query}
+{metric_focus}
+
+=== PRE-COMPUTED STATISTICS (USE THESE VALUES) ===
+{stats_block}
+
+=== ADDITIONAL CONTEXT ===
+{context[:4000]}
+
+IMPORTANT RULES:
+1. The statistics above were computed from the actual dataset - USE THEM
+2. Answer with the EXACT values shown in the statistics
+3. For comparative analysis, show both metrics side by side
+4. Include totals, averages, and any relevant comparisons
+5. DO NOT say "data not available" if statistics are shown above"""
+    else:
+        user_prompt = f"""Answer this data question:
+{user_query}
+{metric_focus}
+
+DATA CONTEXT:
+{context[:6000]}
+
+RULES:
+1. Use EXACT values from the context above
+2. DO NOT make up numbers or estimate
+3. Include summary, key stats, and interpretation
+4. If specific metric requested, focus ONLY on that metric"""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    answer = call_llm(messages, max_tokens=max_tokens)
+    
+    # ========================================================================
+    # STEP 5: FORMAT SOURCES
+    # ========================================================================
     sources = []
     for r in results[:5]:
         sources.append({
@@ -1253,24 +2111,20 @@ def query(
             "type": r.get("type", "text")
         })
     
-    # Get target columns for visualization filtering
-    target_columns = []
-    if specific_metrics and df is not None:
-        target_columns = get_target_columns(specific_metrics, df.columns.tolist())
-    
-    # Determine if visualizations should be shown
-    # ONLY show visualizations if user asked about a SPECIFIC resource
-    show_visualizations = len(specific_metrics) > 0 and len(target_columns) > 0
-    
+    # ========================================================================
+    # STEP 6: RETURN RESPONSE
+    # ========================================================================
     return {
         "answer": answer,
         "sources": sources,
-        "intent": intent,
+        "intent": "data_query",
+        "query_mode": "data_query",
         "detail_mode": detail_mode,
         "specific_metrics": specific_metrics,
         "target_columns": target_columns,
-        "show_visualizations": show_visualizations,
-        "num_chunks": len(results)
+        "show_visualizations": True,  # ALWAYS True for DATA_QUERY
+        "num_chunks": len(results),
+        "query_type": "data"
     }
 
 
@@ -1978,15 +2832,222 @@ Give a SHORT, DIRECT answer. Do NOT provide full dataset analysis."""
 # DOCUMENT ANALYSIS FUNCTIONS
 # ============================================================================
 
-def summarize_document(doc_hash: str) -> Dict[str, Any]:
+def summarize_document(doc_hash: str, dataframe: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     """
-    Generate comprehensive document summary with Python-computed statistics.
+    Generate comprehensive document summary using Python-computed statistics.
+    
+    If a DataFrame is provided, generates a detailed executive summary.
+    Otherwise falls back to LLM-based summary from chunks.
     
     Returns:
         Dict with summary, statistics, sample data, and metadata
     """
     store = get_vector_store()
     
+    # Get document info first
+    docs = store.get_all_documents()
+    doc_info = next((d for d in docs if d.get("doc_hash") == doc_hash), {})
+    filename = doc_info.get("filename", "unknown")
+    
+    # ========================================================================
+    # IF DATAFRAME PROVIDED - Generate Executive Summary with Python
+    # ========================================================================
+    if dataframe is not None and not dataframe.empty:
+        df = dataframe
+        summary_parts = []
+        
+        # ====================================================================
+        # HEADER
+        # ====================================================================
+        summary_parts.append(f"## 📋 Executive Summary: {filename}\n")
+        
+        # ====================================================================
+        # 1. DOCUMENT OVERVIEW
+        # ====================================================================
+        summary_parts.append("### 📄 Document Overview\n")
+        
+        # Detect date range
+        date_range_str = ""
+        date_cols = [c for c in df.columns if 'DATE' in c.upper() or 'TIME' in c.upper()]
+        for col in date_cols[:1]:
+            try:
+                dates = pd.to_datetime(df[col], errors='coerce').dropna()
+                if len(dates) > 0:
+                    start_date = dates.min().strftime('%B %d, %Y')
+                    end_date = dates.max().strftime('%B %d, %Y')
+                    duration_days = (dates.max() - dates.min()).days
+                    date_range_str = f"covering **{start_date}** to **{end_date}** ({duration_days} days)"
+                    break
+            except:
+                pass
+        
+        # Document type detection
+        doc_type = "Production Data" if any('PROD' in c.upper() for c in df.columns) else "Dataset"
+        
+        summary_parts.append(
+            f"**Type:** {doc_type}  \n"
+            f"**Size:** {len(df):,} records × {len(df.columns)} fields  \n"
+            f"**Period:** {date_range_str if date_range_str else 'Not specified'}  \n"
+            f"**Memory:** {df.memory_usage(deep=True).sum() / (1024*1024):.2f} MB\n"
+        )
+        
+        # ====================================================================
+        # 2. KEY METRICS SUMMARY
+        # ====================================================================
+        summary_parts.append("### 📊 Key Metrics Summary\n")
+        
+        # Find all production and sales columns
+        prod_cols = [c for c in df.columns if 'PROD' in c.upper() and 'VOL' in c.upper()]
+        sales_cols = [c for c in df.columns if 'SALES' in c.upper() and 'VOL' in c.upper()]
+        
+        if prod_cols or sales_cols:
+            summary_parts.append("| Metric | Total | Average | Min | Max | Unit |")
+            summary_parts.append("|--------|-------|---------|-----|-----|------|")
+            
+            all_metric_cols = prod_cols[:6] + sales_cols[:4]  # Limit columns
+            for col in all_metric_cols:
+                try:
+                    data = pd.to_numeric(df[col], errors='coerce').dropna()
+                    if len(data) > 0 and data.sum() > 0:
+                        total = data.sum()
+                        avg = data.mean()
+                        min_val = data.min()
+                        max_val = data.max()
+                        
+                        # Get unit
+                        uom = ""
+                        if col + "_UOM" in df.columns:
+                            uom_vals = df[col + "_UOM"].dropna()
+                            uom = uom_vals.iloc[0] if len(uom_vals) > 0 else ""
+                        
+                        # Clean name
+                        display_name = col.replace("_VOL", "").replace("_", " ").title()
+                        summary_parts.append(
+                            f"| {display_name} | {total:,.2f} | {avg:,.2f} | {min_val:,.2f} | {max_val:,.2f} | {uom} |"
+                        )
+                except:
+                    pass
+            summary_parts.append("")
+        
+        # ====================================================================
+        # 3. TOP PERFORMERS (if ITEM_NAME exists)
+        # ====================================================================
+        if 'ITEM_NAME' in df.columns and prod_cols:
+            summary_parts.append("### 🏆 Top 5 Performers\n")
+            
+            # Find main production column
+            main_col = prod_cols[0]
+            try:
+                top_items = df.groupby('ITEM_NAME')[main_col].sum().nlargest(5)
+                if len(top_items) > 0:
+                    display_name = main_col.replace("_VOL", "").replace("_", " ").title()
+                    summary_parts.append(f"**By {display_name}:**\n")
+                    summary_parts.append("| Rank | Item | Total Volume |")
+                    summary_parts.append("|------|------|--------------|")
+                    for rank, (item, value) in enumerate(top_items.items(), 1):
+                        summary_parts.append(f"| {rank} | {item} | {value:,.2f} |")
+                    summary_parts.append("")
+            except:
+                pass
+        
+        # ====================================================================
+        # 4. DATA QUALITY ASSESSMENT
+        # ====================================================================
+        summary_parts.append("### ✅ Data Quality Assessment\n")
+        
+        total_cells = df.size
+        missing_cells = df.isnull().sum().sum()
+        completeness = ((total_cells - missing_cells) / total_cells * 100) if total_cells > 0 else 0
+        
+        # Count empty columns
+        empty_cols = len([c for c in df.columns if df[c].isna().all()])
+        
+        # Count duplicates
+        dup_count = df.duplicated().sum()
+        
+        summary_parts.append(f"| Quality Metric | Status |")
+        summary_parts.append(f"|----------------|--------|")
+        summary_parts.append(f"| Data Completeness | {completeness:.1f}% |")
+        summary_parts.append(f"| Empty Columns | {empty_cols} of {len(df.columns)} |")
+        summary_parts.append(f"| Duplicate Records | {dup_count:,} |")
+        summary_parts.append(f"| Total Missing Values | {missing_cells:,} |")
+        summary_parts.append("")
+        
+        # ====================================================================
+        # 5. KEY INSIGHTS
+        # ====================================================================
+        summary_parts.append("### 💡 Key Insights\n")
+        
+        insights = []
+        
+        # Insight 1: Largest metric
+        if prod_cols:
+            max_col = None
+            max_val = 0
+            for col in prod_cols:
+                try:
+                    val = pd.to_numeric(df[col], errors='coerce').sum()
+                    if val > max_val:
+                        max_val = val
+                        max_col = col
+                except:
+                    pass
+            if max_col:
+                display_name = max_col.replace("PROD_", "").replace("_VOL", "").replace("_", " ").title()
+                insights.append(f"- **Highest Volume:** {display_name} leads with {max_val:,.2f} total units")
+        
+        # Insight 2: Sales efficiency (if both prod and sales exist)
+        if prod_cols and sales_cols:
+            try:
+                prod_total = pd.to_numeric(df[prod_cols[0]], errors='coerce').sum()
+                sales_total = pd.to_numeric(df[sales_cols[0]], errors='coerce').sum()
+                if prod_total > 0:
+                    efficiency = (sales_total / prod_total) * 100
+                    insights.append(f"- **Sales Efficiency:** {efficiency:.1f}% of production was sold")
+            except:
+                pass
+        
+        # Insight 3: Data coverage
+        if date_range_str:
+            insights.append(f"- **Coverage:** Data spans {date_range_str}")
+        
+        # Insight 4: Unique items
+        if 'ITEM_NAME' in df.columns:
+            unique_items = df['ITEM_NAME'].nunique()
+            insights.append(f"- **Scope:** {unique_items:,} unique items/wells tracked")
+        
+        # Insight 5: Data freshness
+        if 'LAST_UPDT_DATE' in df.columns:
+            try:
+                last_update = pd.to_datetime(df['LAST_UPDT_DATE'], errors='coerce').max()
+                if pd.notna(last_update):
+                    insights.append(f"- **Last Updated:** {last_update.strftime('%B %d, %Y')}")
+            except:
+                pass
+        
+        if insights:
+            summary_parts.extend(insights)
+        else:
+            summary_parts.append("- Dataset loaded successfully with all metrics computed")
+        
+        summary_parts.append("")
+        summary_parts.append("---")
+        summary_parts.append("*For detailed analysis, use the Query tab to ask specific questions about this data.*")
+        
+        summary = "\n".join(summary_parts)
+        
+        return {
+            "status": "success",
+            "summary": summary,
+            "filename": filename,
+            "num_chunks": len(store.get_document_chunks(doc_hash)),
+            "num_tables": len(store.get_document_tables(doc_hash)),
+            "is_dataset": True
+        }
+    
+    # ========================================================================
+    # FALLBACK: LLM-based summary from chunks (when no DataFrame)
+    # ========================================================================
     # Get all document content
     full_text = store.get_full_document_text(doc_hash)
     tables = store.get_document_tables(doc_hash)
@@ -1998,38 +3059,37 @@ def summarize_document(doc_hash: str) -> Dict[str, Any]:
             "message": "Document not found or empty"
         }
     
-    # Get document info
-    docs = store.get_all_documents()
-    doc_info = next((d for d in docs if d.get("doc_hash") == doc_hash), {})
-    
     # Build context prioritizing tables - limit size for speed
     if tables:
         context = "\n\n---\n\n".join(t.get("text", "")[:3000] for t in tables[:2])
     else:
         context = full_text[:8000]
     
-    # Generate summary with LLM - optimized prompt
+    # Generate summary with LLM - improved prompt
     messages = [
-        {"role": "system", "content": "Summarize data documents concisely."},
-        {"role": "user", "content": f"""Summarize: {doc_info.get('filename', 'Unknown')}
+        {"role": "system", "content": """You are a data analyst creating executive summaries.
+Create a well-formatted executive summary with these sections:
+1. Document Overview (type, size, date range)
+2. Key Metrics (with actual numbers from the data)
+3. Top Performers (if applicable)
+4. Data Quality Notes
+5. Key Insights (3-5 actionable findings)
 
-DATA:
+Use markdown formatting with tables where appropriate."""},
+        {"role": "user", "content": f"""Create an executive summary for: {filename}
+
+DATA SAMPLE:
 {context}
 
-Provide:
-1. Document type
-2. Key columns
-3. Sample (5 rows)
-4. Key stats
-5. 3 key findings"""}
+Generate a comprehensive executive summary with actual statistics from the data."""}
     ]
     
-    summary = call_llm(messages, max_tokens=2000)
+    summary = call_llm(messages, max_tokens=2500)
     
     return {
         "status": "success",
         "summary": summary,
-        "filename": doc_info.get("filename", "unknown"),
+        "filename": filename,
         "num_chunks": len(chunks),
         "num_tables": len(tables),
         "is_dataset": doc_info.get("is_dataset", False)

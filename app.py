@@ -766,7 +766,9 @@ def render_sidebar():
                     # Quick summary button
                     if st.button("📋 Summary", key=f"sum_{doc.get('doc_hash', '')[:8]}"):
                         with st.spinner("Generating summary..."):
-                            result = summarize_document(doc.get("doc_hash"))
+                            # Try to get DataFrame for better summary
+                            df = get_cached_dataframe(name)
+                            result = summarize_document(doc.get("doc_hash"), dataframe=df)
                             if result.get("status") == "success":
                                 st.session_state.last_result = {
                                     "type": "summary",
@@ -906,7 +908,7 @@ def _render_statistics_panel(statistics: Dict):
 
 
 def render_query():
-    """Render query interface with visualizations."""
+    """Render query interface with visualizations - 4-MODE SYSTEM."""
     st.markdown("### 🤖 Ask Questions")
     
     docs = list_documents()
@@ -915,30 +917,26 @@ def render_query():
         st.info("📤 Upload a document first to start querying!")
         return
     
-    # Document filter
+    # Document selector
     doc_options = {"All Documents": None}
     for doc in docs:
         doc_options[doc.get("filename", "Unknown")] = doc.get("doc_hash")
     
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2 = st.columns([3, 1])
     with col1:
         selected_doc = st.selectbox(
-            "Focus on:",
+            "Select Document:",
             list(doc_options.keys()),
-            index=0
+            index=0,
+            key="query_doc_select"
         )
     with col2:
-        num_sources = st.slider("Sources:", 3, 15, 8)
-    with col3:
-        show_viz = st.checkbox("📊 Auto Charts", value=True, help="Show charts with answer")
-    
-    doc_hash = doc_options[selected_doc]
-    selected_filename = selected_doc if selected_doc != "All Documents" else None
+        show_viz = st.checkbox("📊 Charts", value=True, help="Auto-generate charts for data queries")
     
     # Query input
     user_query = st.text_area(
         "Your question:",
-        placeholder="Ask anything about your documents... Python computes stats, LLM explains.",
+        placeholder="Examples: 'Show me oil production', 'What's in this document?', 'Gas trends over time'",
         height=100
     )
     
@@ -947,7 +945,11 @@ def render_query():
             st.warning("Please enter a question")
             return
         
-        # Get DataFrame for direct Python computation
+        # Get document hash and filename
+        doc_hash = doc_options[selected_doc]
+        selected_filename = selected_doc if selected_doc != "All Documents" else None
+        
+        # Load DataFrame if available
         df = None
         if selected_filename:
             df = get_cached_dataframe(selected_filename)
@@ -957,80 +959,7 @@ def render_query():
                 data_dir = Path(__file__).parent / "data" / "uploads"
                 for file in data_dir.glob("*"):
                     if file.name == selected_filename or selected_filename in file.name:
-                        if file.suffix.lower() in ['.xlsx', '.xls']:
-                            df = pd.read_excel(file)
-                        elif file.suffix.lower() == '.csv':
-                            df = pd.read_csv(file)
-                        if df is not None:
-                            st.session_state.dataframes[selected_filename] = df
-                            break
-        
-        # Debug: Show if DataFrame was found
-        if df is not None:
-            st.success(f"📊 Data loaded: {len(df):,} rows × {len(df.columns)} columns")
-        # Don't show warning - the query function will still try to load data
-        
-        # Update the cache in rag_engine
-        set_dataframe_cache(st.session_state.dataframes)
-        
-        with st.spinner("🧠 Computing statistics with Python..."):
-            result = query(user_query, doc_hash=doc_hash, k=num_sources, dataframe=df)
-        
-        # Show intent
-        intent = result.get("intent", "general")
-        intent_info = {
-            "general_overview": ("📋", "Dataset Overview"),  # NO CHARTS for this
-            "metric_lookup": ("🔢", "Metric Lookup"),
-            "explain": ("📖", "Explanation"),
-            "summarize": ("📋", "Summary"),
-            "calculate": ("🔢", "Calculation"),
-            "show": ("📊", "Data Display"),
-            "search": ("🔍", "Search"),
-            "compare": ("🔄", "Comparison"),
-            "trend": ("📈", "Trend Analysis"),
-            "anomaly": ("⚠️", "Anomaly Detection"),
-            "general": ("💬", "General Query")
-        }
-        icon, label = intent_info.get(intent, ("💬", "Query"))
-        st.markdown(f"**Detected Intent:** {icon} {label}")
-        
-        # Show answer
-        st.markdown("### 📝 Answer")
-        st.markdown(result.get("answer", "No answer generated"))
-        
-        # ====================================================================
-        # STRICT VISUALIZATION LOGIC
-        # ====================================================================
-        # Check if visualizations should be shown
-        # ONLY show visualizations if:
-        # 1. User explicitly asked for charts AND
-        # 2. User asked about a SPECIFIC resource (oil, gas, water, etc.)
-        # 
-        # DO NOT show visualizations for:
-        # - General queries ("what's in this document?")
-        # - Overview requests ("summarize the dataset")
-        # - Any query without a specific metric mentioned
-        # ====================================================================
-        
-        show_visualizations = result.get("show_visualizations", False)
-        specific_metrics = result.get("specific_metrics", [])
-        
-        # Double-check: if intent is general_overview, NEVER show visualizations
-        if intent == "general_overview":
-            show_visualizations = False
-        
-        # Also check the query directly - if no specific resource mentioned, no charts
-        if is_general_query(user_query):
-            show_visualizations = False
-        
-        if show_viz and selected_filename and show_visualizations and specific_metrics:
-            df = get_cached_dataframe(selected_filename)
-            if df is None:
-                # Try loading from uploads directory
-                data_dir = Path(__file__).parent / "data" / "uploads"
-                try:
-                    for file in data_dir.glob("*"):
-                        if file.name == selected_filename or selected_filename in file.name:
+                        try:
                             if file.suffix.lower() in ['.xlsx', '.xls']:
                                 df = pd.read_excel(file)
                             elif file.suffix.lower() == '.csv':
@@ -1038,88 +967,144 @@ def render_query():
                             if df is not None:
                                 st.session_state.dataframes[selected_filename] = df
                                 break
-                except Exception:
-                    pass
-                
-                # Fallback to current directory
-                if df is None:
-                    try:
-                        filepath = Path(__file__).parent / selected_filename
-                        if filepath.exists():
-                            if selected_filename.endswith('.csv'):
-                                df = pd.read_csv(filepath)
-                            else:
-                                df = pd.read_excel(filepath)
-                            st.session_state.dataframes[selected_filename] = df
-                    except Exception:
-                        df = None
-            
+                        except:
+                            pass
+        
+        # Update the cache in rag_engine
+        set_dataframe_cache(st.session_state.dataframes)
+        
+        # Execute query
+        with st.spinner("Processing..."):
+            result = query(user_query, doc_hash=doc_hash, k=10, dataframe=df)
+        
+        # ===================================================================
+        # 4-MODE RESPONSE HANDLING
+        # ===================================================================
+        query_mode = result.get("query_mode", "data_query")
+        
+        # ---------------------------------------------------------------
+        # MODE 1: FREEFORM_QUERY - Show refusal message only
+        # ---------------------------------------------------------------
+        if query_mode == "freeform_query":
+            st.markdown("### ⚠️ Non-Data Query Detected")
+            st.markdown(result.get("answer", ""))
+            return
+        
+        # ---------------------------------------------------------------
+        # MODE 2: SYSTEM_TASK - Show system guidance only
+        # ---------------------------------------------------------------
+        if query_mode == "system_task":
+            st.markdown("### 🔧 System Request")
+            st.markdown(result.get("answer", ""))
+            return
+        
+        # ---------------------------------------------------------------
+        # MODE 3: DOCUMENT_OVERVIEW - Show detailed overview (no charts)
+        # ---------------------------------------------------------------
+        if query_mode == "document_overview":
             if df is not None:
-                st.markdown("---")
-                st.markdown(f"### 📊 {', '.join(specific_metrics).upper()} Visualizations")
-                
-                # Get key columns - FILTER by specific_metrics from query result
-                numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-                all_prod_cols = [c for c in numeric_cols if any(x in c.upper() for x in ['PROD', 'SALES', 'VOL', 'ENERGY', 'FUEL', 'FLARE', 'INJ'])]
-                
-                # Use target_columns from result if available, otherwise filter by metric
-                target_cols = result.get('target_columns', [])
-                
-                if target_cols:
-                    # Use the pre-computed target columns
-                    prod_cols = [c for c in all_prod_cols if c in target_cols][:6]
+                st.info(f"📊 Dataset: {len(df):,} rows × {len(df.columns)} columns")
+            st.markdown(result.get("answer", ""))
+            return
+        
+        # ---------------------------------------------------------------
+        # MODE 4: DATA_QUERY - Full analysis with statistics and charts
+        # ---------------------------------------------------------------
+        
+        # Show dataset info
+        if df is not None:
+            st.info(f"📊 Analyzed: {len(df):,} rows × {len(df.columns)} columns")
+        
+        # Show answer
+        st.markdown("### 📋 Analysis Result")
+        st.markdown(result.get("answer", "No answer generated"))
+        
+        # Get visualization parameters from result
+        show_visualizations = result.get("show_visualizations", False)
+        specific_metrics = result.get("specific_metrics", [])
+        target_columns = result.get("target_columns", [])
+        
+        # ===================================================================
+        # GENERATE VISUALIZATIONS (ONLY for DATA_QUERY with metrics)
+        # ===================================================================
+        if show_viz and show_visualizations and df is not None and (specific_metrics or target_columns):
+            st.markdown("---")
+            
+            # Get columns to visualize
+            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+            
+            # ================================================================
+            # STRICT METRIC FILTERING - Only show columns for requested metric
+            # ================================================================
+            metric_column_map = {
+                'oil': ['OIL'],
+                'gas': ['GAS'],
+                'water': ['WAT', 'WATER'],
+                'condensate': ['COND'],
+                'lpg': ['LPG'],
+                'ngl': ['NGL'],
+                'energy': ['ENERGY', 'BTU'],
+                'heat': ['HEAT'],
+                'injection': ['INJ'],
+                'production': ['PROD'],
+                'sales': ['SALES']
+            }
+            
+            # Get the EXACT keywords for requested metrics only
+            filter_keywords = []
+            for m in specific_metrics:
+                if m in metric_column_map:
+                    filter_keywords.extend(metric_column_map[m])
+            
+            # Filter target_columns to ONLY include the requested metric
+            if target_columns and filter_keywords:
+                # Strict filter: column must contain at least one keyword
+                prod_cols = [
+                    c for c in target_columns 
+                    if c in numeric_cols and any(kw in c.upper() for kw in filter_keywords)
+                ][:4]  # Limit to 4 columns max
+            elif target_columns:
+                # No specific filter keywords, but have target columns
+                prod_cols = [c for c in target_columns if c in numeric_cols][:4]
+            else:
+                # Fallback: find columns matching the metric keywords
+                all_prod_cols = [c for c in numeric_cols if any(x in c.upper() for x in ['PROD', 'SALES', 'VOL', 'ENERGY', 'INJ'])]
+                if filter_keywords:
+                    prod_cols = [c for c in all_prod_cols if any(kw in c.upper() for kw in filter_keywords)][:4]
                 else:
-                    # Fallback: filter by specific_metrics from result
-                    metric_filters = {
-                        'gas': ['GAS'],
-                        'oil': ['OIL'],
-                        'water': ['WAT', 'WATER'],
-                        'condensate': ['COND'],
-                        'lpg': ['LPG'],
-                        'ngl': ['NGL'],
-                        'heat': ['HEAT'],
-                        'energy': ['ENERGY', 'BTU']
-                    }
-                    
-                    filter_keywords = []
-                    for m in specific_metrics:
-                        filter_keywords.extend(metric_filters.get(m, []))
-                    
-                    prod_cols = [c for c in all_prod_cols 
-                                if any(kw in c.upper() for kw in filter_keywords)][:6]
+                    prod_cols = all_prod_cols[:4]
+            
+            if prod_cols:
+                metric_title = ', '.join(specific_metrics).upper() if specific_metrics else "Production"
+                st.markdown(f"### 📊 {metric_title} Visualizations")
+                st.info(f"📌 Showing charts for: {', '.join(prod_cols[:4])}")
                 
-                if prod_cols:
-                    st.info(f"📌 Showing charts for {', '.join(specific_metrics).upper()}: {', '.join(prod_cols)}")
-                else:
-                    st.warning("No matching columns found for the requested metric.")
+                # Quick stats cards
+                stat_cols = st.columns(min(len(prod_cols), 4))
+                for i, col in enumerate(prod_cols[:4]):
+                    with stat_cols[i]:
+                        data = df[col].dropna()
+                        unit = ""
+                        uom_col = col + "_UOM"
+                        if uom_col in df.columns:
+                            uom_vals = df[uom_col].dropna()
+                            unit = uom_vals.iloc[0] if len(uom_vals) > 0 else ""
+                        st.metric(
+                            col[:15] + "..." if len(col) > 15 else col,
+                            f"{data.sum():,.0f}",
+                            f"Avg: {data.mean():,.1f} {unit}"
+                        )
                 
-                # Show quick stats metrics - ONLY for filtered columns
-                if prod_cols:
-                    stat_cols = st.columns(min(len(prod_cols), 4))
-                    for i, col in enumerate(prod_cols[:4]):
-                        with stat_cols[i]:
-                            data = df[col].dropna()
-                            unit = ""
-                            uom_col = col + "_UOM"
-                            if uom_col in df.columns:
-                                uom_vals = df[uom_col].dropna()
-                                unit = uom_vals.iloc[0] if len(uom_vals) > 0 else ""
-                            st.metric(
-                                col[:15] + "..." if len(col) > 15 else col,
-                                f"{data.sum():,.0f}",
-                                f"Avg: {data.mean():,.1f} {unit}"
-                            )
-                
-                # Generate relevant chart based on intent
-                chart_tabs = st.tabs(["📈 Production Trend", "📊 By Category", "🥧 Distribution"])
+                # Chart tabs
+                chart_tabs = st.tabs(["📈 Trend", "📊 Bar Chart", "🥧 Distribution"])
                 
                 with chart_tabs[0]:
-                    # Time series chart
+                    # Time series - show ALL requested metrics
                     date_col = None
                     for col in df.columns:
                         if 'DATE' in col.upper() or 'TIME' in col.upper():
                             try:
-                                df[col] = pd.to_datetime(df[col])
+                                df[col] = pd.to_datetime(df[col], errors='coerce')
                                 date_col = col
                                 break
                             except:
@@ -1127,72 +1112,101 @@ def render_query():
                     
                     if date_col and prod_cols:
                         df_sorted = df.sort_values(date_col)
-                        agg_data = df_sorted.groupby(date_col)[prod_cols[0]].sum().reset_index()
                         
-                        fig = px.line(
-                            agg_data, x=date_col, y=prod_cols[0],
-                            title=f"{prod_cols[0]} Over Time",
-                            labels={prod_cols[0]: prod_cols[0]}
+                        # Create multi-line chart for ALL metrics
+                        fig = go.Figure()
+                        colors = px.colors.qualitative.Set2
+                        
+                        for i, metric_col in enumerate(prod_cols[:4]):  # Show up to 4 metrics
+                            agg_data = df_sorted.groupby(date_col)[metric_col].sum().reset_index()
+                            fig.add_trace(go.Scatter(
+                                x=agg_data[date_col],
+                                y=agg_data[metric_col],
+                                mode='lines+markers',
+                                name=metric_col,
+                                line=dict(width=2, color=colors[i % len(colors)]),
+                                marker=dict(size=4)
+                            ))
+                        
+                        fig.update_layout(
+                            title=f"{metric_title} Trends Over Time",
+                            xaxis_title="Date",
+                            yaxis_title="Volume",
+                            height=450,
+                            hovermode='x unified',
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02)
                         )
-                        fig.update_layout(height=350)
                         st.plotly_chart(fig, use_container_width=True)
                     else:
                         st.info("No date column found for time series.")
                 
                 with chart_tabs[1]:
-                    # Bar chart by category
+                    # Bar chart - show ALL metrics side by side
                     cat_cols = [c for c in df.columns if df[c].dtype == 'object' and df[c].nunique() <= 50]
                     if cat_cols and prod_cols:
-                        cat_col = cat_cols[0] if 'ITEM_NAME' not in cat_cols else 'ITEM_NAME'
-                        if 'ITEM_NAME' in df.columns:
-                            cat_col = 'ITEM_NAME'
+                        cat_col = 'ITEM_NAME' if 'ITEM_NAME' in df.columns else cat_cols[0]
                         
-                        agg_data = df.groupby(cat_col)[prod_cols[0]].sum().reset_index()
-                        agg_data = agg_data.nlargest(10, prod_cols[0])
+                        # Aggregate ALL metrics by category
+                        agg_dict = {col: 'sum' for col in prod_cols[:4]}
+                        agg_data = df.groupby(cat_col).agg(agg_dict).reset_index()
                         
-                        fig = px.bar(
-                            agg_data, x=cat_col, y=prod_cols[0],
-                            title=f"Top 10 by {prod_cols[0]}",
-                            color=prod_cols[0],
-                            color_continuous_scale='Viridis'
+                        # Sort by total of all metrics and get top 10
+                        agg_data['_total'] = agg_data[prod_cols[:4]].sum(axis=1)
+                        agg_data = agg_data.nlargest(10, '_total').drop(columns=['_total'])
+                        
+                        # Create grouped bar chart
+                        fig = go.Figure()
+                        colors = px.colors.qualitative.Set2
+                        
+                        for i, metric_col in enumerate(prod_cols[:4]):
+                            fig.add_trace(go.Bar(
+                                x=agg_data[cat_col],
+                                y=agg_data[metric_col],
+                                name=metric_col,
+                                marker_color=colors[i % len(colors)]
+                            ))
+                        
+                        fig.update_layout(
+                            title=f"Top 10 by {metric_title}",
+                            xaxis_title=cat_col,
+                            yaxis_title="Volume",
+                            barmode='group',
+                            height=450,
+                            xaxis_tickangle=-45,
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02)
                         )
-                        fig.update_layout(height=350, xaxis_tickangle=-45)
                         st.plotly_chart(fig, use_container_width=True)
                     else:
-                        st.info("No categorical columns found.")
+                        st.info("No categorical columns found for bar chart.")
                 
                 with chart_tabs[2]:
-                    # Pie chart - only show for requested metrics
+                    # Pie chart
                     if len(prod_cols) >= 2:
-                        totals = {col: df[col].sum() for col in prod_cols[:4]}
-                        specific_metrics = result.get('specific_metrics', [])
-                        title = f"{', '.join(specific_metrics).title()} Distribution" if specific_metrics else "Production Distribution"
+                        totals = {col: df[col].sum() for col in prod_cols[:5]}
+                        title = f"{metric_title} Distribution"
                         fig = px.pie(
                             values=list(totals.values()),
                             names=list(totals.keys()),
                             title=title,
                             hole=0.4
                         )
-                        fig.update_layout(height=350)
+                        fig.update_layout(height=400)
                         st.plotly_chart(fig, use_container_width=True)
-                    elif len(prod_cols) == 1:
-                        # Single metric - show breakdown by category if available
-                        cat_cols = [c for c in df.columns if df[c].dtype == 'object' and df[c].nunique() <= 20]
-                        if cat_cols:
-                            cat_col = cat_cols[0]
-                            agg_data = df.groupby(cat_col)[prod_cols[0]].sum().reset_index()
-                            agg_data = agg_data.nlargest(8, prod_cols[0])
-                            fig = px.pie(
-                                agg_data, values=prod_cols[0], names=cat_col,
-                                title=f"{prod_cols[0]} by {cat_col}",
-                                hole=0.4
-                            )
-                            fig.update_layout(height=350)
-                            st.plotly_chart(fig, use_container_width=True)
-                        else:
-                            st.info(f"Showing single metric: {prod_cols[0]} (Total: {df[prod_cols[0]].sum():,.0f})")
+                    elif len(prod_cols) == 1 and cat_cols:
+                        cat_col = cat_cols[0]
+                        agg_data = df.groupby(cat_col)[prod_cols[0]].sum().reset_index()
+                        agg_data = agg_data.nlargest(8, prod_cols[0])
+                        fig = px.pie(
+                            agg_data, values=prod_cols[0], names=cat_col,
+                            title=f"{prod_cols[0]} by {cat_col}",
+                            hole=0.4
+                        )
+                        fig.update_layout(height=400)
+                        st.plotly_chart(fig, use_container_width=True)
                     else:
-                        st.info("No production columns found for this metric.")
+                        st.info(f"Single metric: {prod_cols[0]} (Total: {df[prod_cols[0]].sum():,.0f})")
+            else:
+                st.warning("No matching columns found for the requested metrics.")
         
         # Show sources (collapsed)
         sources = result.get("sources", [])
@@ -1231,7 +1245,9 @@ def render_quick_actions():
             )
             if doc_hash:
                 with st.spinner("Generating comprehensive summary..."):
-                    result = summarize_document(doc_hash)
+                    # Get DataFrame for better summary
+                    df = get_cached_dataframe(doc_for_summary)
+                    result = summarize_document(doc_hash, dataframe=df)
                 
                 if result.get("status") == "success":
                     st.session_state.last_result = {
@@ -1277,6 +1293,84 @@ def render_quick_actions():
         if result["type"] == "summary":
             st.markdown(f"### 📋 Summary: {result['doc']}")
             st.markdown(result["content"])
+            
+            # ================================================================
+            # ADD VISUALIZATIONS TO SUMMARY
+            # ================================================================
+            df = get_cached_dataframe(result['doc'])
+            if df is not None:
+                st.markdown("---")
+                st.markdown("### 📊 Key Visualizations")
+                
+                # Get production columns
+                numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+                prod_cols = [c for c in numeric_cols if any(x in c.upper() for x in ['PROD', 'SALES']) and 'VOL' in c.upper()][:5]
+                
+                if prod_cols:
+                    # Create two columns for charts
+                    viz_col1, viz_col2 = st.columns(2)
+                    
+                    with viz_col1:
+                        # Pie chart - Production Distribution
+                        totals = {col.replace('PROD_', '').replace('SALES_', '').replace('_VOL', ''): df[col].sum() 
+                                  for col in prod_cols if df[col].sum() > 0}
+                        if totals:
+                            fig = px.pie(
+                                values=list(totals.values()),
+                                names=list(totals.keys()),
+                                title="Production Volume Distribution",
+                                hole=0.4
+                            )
+                            fig.update_layout(height=350)
+                            st.plotly_chart(fig, use_container_width=True)
+                    
+                    with viz_col2:
+                        # Bar chart - Top metrics
+                        if len(prod_cols) >= 2:
+                            bar_data = {col.replace('PROD_', '').replace('SALES_', '').replace('_VOL', ''): df[col].sum() 
+                                       for col in prod_cols[:5]}
+                            fig = px.bar(
+                                x=list(bar_data.keys()),
+                                y=list(bar_data.values()),
+                                title="Total Volume by Metric",
+                                labels={'x': 'Metric', 'y': 'Total Volume'}
+                            )
+                            fig.update_layout(height=350)
+                            st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Time series if date column exists
+                    date_cols = [c for c in df.columns if 'DATE' in c.upper() or 'TIME' in c.upper()]
+                    if date_cols and prod_cols:
+                        try:
+                            date_col = date_cols[0]
+                            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+                            df_sorted = df.sort_values(date_col)
+                            
+                            # Aggregate by date
+                            fig = go.Figure()
+                            colors = px.colors.qualitative.Set2
+                            for i, col in enumerate(prod_cols[:3]):
+                                agg_data = df_sorted.groupby(date_col)[col].sum().reset_index()
+                                display_name = col.replace('PROD_', '').replace('SALES_', '').replace('_VOL', '')
+                                fig.add_trace(go.Scatter(
+                                    x=agg_data[date_col],
+                                    y=agg_data[col],
+                                    mode='lines',
+                                    name=display_name,
+                                    line=dict(width=2, color=colors[i % len(colors)])
+                                ))
+                            
+                            fig.update_layout(
+                                title="Production Trends Over Time",
+                                xaxis_title="Date",
+                                yaxis_title="Volume",
+                                height=400,
+                                hovermode='x unified',
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            pass  # Skip if date parsing fails
             
         elif result["type"] == "info":
             st.markdown(f"### ℹ️ Document Info: {result['doc']}")
